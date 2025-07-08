@@ -1,0 +1,12 @@
+msturing-30M:
+    diskann: 
+      docker-tag: neurips23-streaming-diskann
+      module: baselines.diskann.diskann-str
+      constructor: diskann
+      base-args: ["@metric"]
+      run-groups:
+        base:
+          args: |
+            [{"R":64, "L":75, "insert_threads":16, "consolidate_threads":16}]
+          query-args: |
+            [{"Ls":70, "T":16}]

@@ -1,0 +1,13 @@
+msturing-30M:
+  max_pts: 30000000
+  res_path: /data2/pyc/workspace/ffanns/results/MSTuring-30M/search_results/search_64.bin
+  1:
+    operation: insert
+    start: 0
+    end: 8000
+  2:
+    operation: insert
+    start: 8000
+    end: 16000
+  3:
+    operation: search

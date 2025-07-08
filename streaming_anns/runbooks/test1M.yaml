@@ -1,0 +1,129 @@
+msturing-30M:
+  max_pts: 30000000
+  res_path: /data2/pyc/workspace/ffanns/results/MSTuring-30M/search_results/search_64.bin
+  1:
+    operation: insert
+    start: 0
+    end: 1000000
+  2:
+    operation: search
+  3:
+    operation: insert
+    start: 1000000
+    end: 1008000
+  4:
+    operation: search
+  5:
+    operation: insert
+    start: 1008000
+    end: 1016000
+  6:
+    operation: search
+  7:
+    operation: insert
+    start: 1016000
+    end: 1024000
+  8:
+    operation: search
+  9:
+    operation: insert
+    start: 1024000
+    end: 1032000
+  10:
+    operation: search
+  11:
+    operation: insert
+    start: 1032000
+    end: 1040000
+  12:
+    operation: search
+  13:
+    operation: insert
+    start: 1040000
+    end: 1048000
+  14:
+    operation: search
+  15:
+    operation: insert
+    start: 1048000
+    end: 1056000
+  16:
+    operation: search
+  17:
+    operation: insert
+    start: 1056000
+    end: 1064000
+  18:
+    operation: search
+  19:
+    operation: insert
+    start: 1064000
+    end: 1072000
+  20:
+    operation: search
+  21:
+    operation: insert
+    start: 1072000
+    end: 1080000
+  22:
+    operation: search
+  23:
+    operation: insert
+    start: 1080000
+    end: 1088000
+  24:
+    operation: search
+  25:
+    operation: insert
+    start: 1088000
+    end: 1096000
+  26:
+    operation: search
+  27:
+    operation: insert
+    start: 1096000
+    end: 1104000
+  28:
+    operation: search
+  29:
+    operation: insert
+    start: 1104000
+    end: 1112000
+  30:
+    operation: search
+  31:
+    operation: insert
+    start: 1112000
+    end: 1120000
+  32:
+    operation: search
+  33:
+    operation: insert
+    start: 1120000
+    end: 1128000
+  34:
+    operation: search
+  35:
+    operation: insert
+    start: 1128000
+    end: 1136000
+  36:
+    operation: search
+  37:
+    operation: insert
+    start: 1136000
+    end: 1144000
+  38:
+    operation: search
+  39:
+    operation: insert
+    start: 1144000
+    end: 1152000
+  40:
+    operation: search
+  41:
+    operation: insert
+    start: 1152000
+    end: 1160000
+  42:
+    operation: search
