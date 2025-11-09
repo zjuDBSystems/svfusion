@@ -30,8 +30,8 @@ inline RAFT_KERNEL update_d_graph_kernel(IdxT* __restrict__ device_graph,
   if (row_idx < row_count) {
     uint32_t target_row = positions[row_idx];
     if (target_row != UINT32_MAX) {
-      auto update_buffer_ptr = update_buffer + row_idx * degree;
-      auto device_graph_ptr = device_graph + target_row * degree;
+      auto update_buffer_ptr = update_buffer + (size_t)row_idx * degree;
+      auto device_graph_ptr = device_graph + (size_t)target_row * degree;
       for (size_t col_idx = 0; col_idx < degree; col_idx += 1) {
         device_graph_ptr[col_idx] = update_buffer_ptr[col_idx];
       }
@@ -50,8 +50,18 @@ void add_node_core(
   raft::device_matrix_view<IdxT, std::int64_t> updated_d_graph,
   raft::host_vector_view<int, std::int64_t> host_num_incoming_edges,
   std::uint32_t chunk_id,
-  const std::size_t insert_position)
+  const std::size_t insert_position,
+  const cagra::extend_params& extend_params,
+  ffanns::neighbors::cagra::search_context<T, IdxT>* search_ctx = nullptr)
 {
+  // cudaEvent_t start, stop, tag1, search_done, step2_done, step3_done;
+  // cudaEventCreate(&start);
+  // cudaEventCreate(&stop); 
+  // cudaEventCreate(&tag1);
+  // cudaEventCreate(&search_done);
+  // cudaEventCreate(&step2_done);
+  // cudaEventCreate(&step3_done);
+  // cudaEventRecord(start, raft::resource::get_cuda_stream(handle));
   // auto delete_bitset_ptr = idx.get_delete_bitset_ptr();
   // auto count_scalar = raft::make_device_scalar<int64_t>(handle, 0);
   // delete_bitset_ptr->count(handle, count_scalar.view());
@@ -77,19 +87,17 @@ void add_node_core(
     time_log << "chunk_id,search_time_ms,total_time_ms\n";
   }
   #endif
-  cudaEvent_t start, stop, search_done, step2_done;
-  cudaEventCreate(&start);
-  cudaEventCreate(&stop); 
-  cudaEventCreate(&search_done);
-  cudaEventCreate(&step2_done);
   // RAFT_LOG_INFO("New size: %ld", new_size);
   // auto host_num_incoming_edges = raft::make_host_vector<int, std::uint64_t>(new_size);
   // RAFT_LOG_INFO("[host_num_incoming_edges] [first element] = %d", *(static_cast<const int*>(host_num_incoming_edges.data_handle())));
 
-  const std::size_t max_chunk_size = 8192;
+  // const std::size_t max_chunk_size = 10000;
+  const std::size_t max_chunk_size = extend_params.max_chunk_size == 0 ? 10000 : extend_params.max_chunk_size;
   ffanns::neighbors::cagra::search_params params;
-  params.max_iterations = 100;
+  // params.algo = ffanns::neighbors::cagra::search_algo::MULTI_KERNEL;
+  params.max_iterations = extend_params.max_chunk_size == 0 ? 120 : 30;
   params.itopk_size = std::max(base_degree * 2lu, 256lu);
+  params.metric = idx.metric();
 
   // Memory space for rank-based neighbor list
   auto mr = raft::resource::get_workspace_resource(handle);
@@ -116,9 +124,7 @@ void add_node_core(
     mr);
   
   for (const auto& batch : additional_dataset_batch) {
-    cudaEventRecord(start, raft::resource::get_cuda_stream(handle));
     // Step 1: Obtain K (=base_degree) nearest neighbors of the new vectors by CAGRA search
-    // Create queries
     RAFT_CUDA_TRY(cudaMemcpy2DAsync(queries.data_handle(),
                                     sizeof(T) * dim,
                                     batch.data(),
@@ -149,17 +155,25 @@ void add_node_core(
     
     auto delete_bitset_ptr = idx.get_delete_bitset_ptr();
     auto delete_filter = ffanns::neighbors::filtering::bitset_filter(delete_bitset_ptr->view());
-    // RAFT_LOG_INFO("[add_node_core] Search begin");
+    // cudaEventRecord(tag1, raft::resource::get_cuda_stream(handle));
     neighbors::cagra::search(
-      handle, params, idx, queries_view, host_queries_view, neighbor_indices_view, neighbor_distances_view, delete_filter);
-    // neighbors::cagra::search(
-    //   handle, params, idx, queries_view, neighbor_indices_view, neighbor_distances_view);
+      handle, params, idx, queries_view, host_queries_view, neighbor_indices_view, neighbor_distances_view, delete_filter, false, search_ctx);
+    
     raft::copy(host_neighbor_indices.data_handle(),
             neighbor_indices.data_handle(),
             batch.size() * base_degree,
             raft::resource::get_cuda_stream(handle));
     raft::resource::sync_stream(handle);
-    cudaEventRecord(search_done, raft::resource::get_cuda_stream(handle));
+    // cudaEventRecord(search_done, raft::resource::get_cuda_stream(handle));
+    // RAFT_LOG_INFO("[add_node_core] Search done");
+    // for (std::size_t vec_i = 0; vec_i < batch.size(); vec_i++) {
+    //   for (std::uint32_t i = 0; i < base_degree; i++) {
+    //     const auto a_id = host_neighbor_indices(vec_i, i);
+    //     if (a_id >= new_size) {
+    //       std::fprintf(stderr, "!!!!!Invalid neighbor index (%u)\n", a_id);
+    //     }
+    //   }
+    // }
 
     auto host_delete_bitset_ptr = idx.get_host_delete_bitset_ptr();
     // Step 2: rank-based reordering
@@ -193,28 +207,12 @@ void add_node_core(
                 [&](const std::pair<IdxT, std::size_t> a, const std::pair<IdxT, std::size_t> b) {
                   return a.second < b.second;
                 });
-      
-      // TODO: 有重复，暂时先在这里执行去重
-      std::unordered_set<IdxT> added_nodes;
-      added_nodes.reserve(base_degree);
-      std::size_t unique_count = 0;
-      for (std::size_t i = 0; i < base_degree && unique_count < degree; i++) {
-        const auto node_id = detourable_node_count_list[i].first;
-        if (added_nodes.insert(node_id).second) {
-          updated_graph(insert_position + batch.offset() + vec_i, unique_count++) = node_id;
-        }
-        if (node_id >= new_size) {
-          RAFT_LOG_INFO("[add_node_core]Invalid node id (%u)", detourable_node_count_list[i].first);
-        }
-      }
-      if (unique_count < degree) {
-        RAFT_LOG_INFO("[add_node_core] Detourable node count is less than degree: %lu < %lu", unique_count, degree);
+      for (std::size_t i = 0; i < degree; i++) {
+          updated_graph(insert_position + batch.offset() + vec_i, i) = detourable_node_count_list[i].first;
       }
     }
     // }
-    // RAFT_LOG_INFO("[add_node_core] Search Step 2 done");
-    cudaEventRecord(step2_done, raft::resource::get_cuda_stream(handle));
-    cudaEventSynchronize(step2_done);
+    // cudaEventRecord(step2_done, raft::resource::get_cuda_stream(handle));
 
     // Step 3: Add reverse edges
     std::unordered_set<uint32_t> updated_rows;
@@ -231,10 +229,13 @@ void add_node_core(
       for (std::size_t vec_i = omp_get_thread_num(); vec_i < batch.size();
         vec_i += omp_get_num_threads()) {
         // Create a reverse edge list
+        std::size_t valid_rev_cnt = 0; 
         const auto target_new_node_id = insert_position + batch.offset() + vec_i;
         for (std::size_t i = 0; i < num_rev_edges; i++) {
           const auto target_node_id = updated_graph(insert_position + batch.offset() + vec_i, i);
-
+          if (target_node_id >= new_size) {
+            RAFT_LOG_INFO("Invalid target_node_id (%u) at i=%d for target_new_node_id=%u", target_node_id, i, target_new_node_id);
+          }
           IdxT replace_id                        = new_size;
           IdxT replace_id_j                      = 0;
           std::size_t replace_num_incoming_edges = 0;
@@ -248,7 +249,6 @@ void add_node_core(
               continue;
             }
 
-            // const std::size_t num_incoming_edges = host_num_incoming_edges(neighbor_id);
             std::size_t num_incoming_edges;
             // #pragma omp atomic read
             num_incoming_edges = host_num_incoming_edges(neighbor_id);
@@ -270,18 +270,17 @@ void add_node_core(
             }
           }
           if (replace_id >= new_size) {
-            std::fprintf(stderr, "Invalid rev edge index (%u)\n", replace_id);
+            std::fprintf(stderr, "!!!!!Invalid rev edge index (%u)\n", replace_id);
             continue;
           }
           
-           // 使用局部锁处理图更新 - 可以使用细粒度锁进一步优化
-          //  #pragma omp critical(graph_update)
-          //  {
-          //      updated_graph(target_node_id, replace_id_j) = target_new_node_id;
-          //      edge_log->record_update(target_node_id, target_new_node_id);
-          //  }
+          // 使用局部锁处理图更新 - 可以使用细粒度锁进一步优化
+          // #pragma omp critical(graph_update)
+          // {
+          //     updated_graph(target_node_id, replace_id_j) = target_new_node_id;
+          //     // edge_log->record_update(target_node_id, target_new_node_id);
+          // }
           updated_graph(target_node_id, replace_id_j) = target_new_node_id;
-          // updated_graph(target_node_id, replace_id_j) = target_new_node_id;
           // edge_log->record_update(target_node_id, target_new_node_id);
           // #pragma omp atomic update 
           host_num_incoming_edges(target_new_node_id)++;
@@ -290,7 +289,8 @@ void add_node_core(
           host_num_incoming_edges(replace_id)--; 
           // updated_rows.insert(target_node_id);
           local_updated_rows.insert(target_node_id);
-          rev_edges[i]                                = replace_id;
+          // rev_edges[i] = replace_id;
+          rev_edges[valid_rev_cnt++] = replace_id; 
         }
 
         // Create a neighbor list of a new node by interleaving the kNN neighbor list and reverse edge
@@ -299,11 +299,13 @@ void add_node_core(
         const auto rank_based_list_ptr =
           updated_graph.data_handle() + (insert_position + batch.offset() + vec_i) * degree;
         const auto rev_edges_return_list_ptr = rev_edges.data();
-        while (num_add < degree) {
+        while ((num_add < degree) &&
+        ((rank_base_i < degree) || (rev_edges_return_i < num_rev_edges))) {
           const auto node_list_ptr =
             interleave_switch == 0 ? rank_based_list_ptr : rev_edges_return_list_ptr;
           auto& node_list_index          = interleave_switch == 0 ? rank_base_i : rev_edges_return_i;
-          const auto max_node_list_index = interleave_switch == 0 ? degree : num_rev_edges;
+          // const auto max_node_list_index = interleave_switch == 0 ? degree : num_rev_edges;
+          const std::uint32_t max_node_list_index = interleave_switch == 0 ? degree : valid_rev_cnt;
           for (; node_list_index < max_node_list_index; node_list_index++) {
             const auto candidate = node_list_ptr[node_list_index];
             // Check duplication
@@ -325,6 +327,10 @@ void add_node_core(
           }
           interleave_switch = 1 - interleave_switch;
         }
+        if (num_add < degree) {
+          RAFT_FAIL("Number of edges is not enough (target_new_node_id:%lu, num_add:%lu, degree:%lu)",
+                    (uint64_t)target_new_node_id, (uint64_t)num_add, (uint64_t)degree);
+        }
         for (std::uint32_t i = 0; i < degree; i++) {
           const auto new_neighbor = temp[i];
           if (!host_delete_bitset_ptr->test(new_neighbor)) {
@@ -335,23 +341,21 @@ void add_node_core(
           host_num_incoming_edges(new_neighbor)++;
         }
       }
-      // updated_rows.insert(local_updated_rows.begin(), local_updated_rows.end());
-    }
-
+    // updated_rows.insert(local_updated_rows.begin(), local_updated_rows.end());
+  }
+    // cudaEventRecord(step3_done, raft::resource::get_cuda_stream(handle));
     for (const auto& local_set : thread_updated_rows) {
       updated_rows.insert(local_set.begin(), local_set.end());
-  }
+    }
 
     std::vector<uint32_t> sorted_rows(updated_rows.begin(), updated_rows.end());
     size_t updated_size = sorted_rows.size();
-    RAFT_LOG_INFO("[add_node_graph] sorted_rows.size() = %lu", updated_size);
 
-    // auto host_buffer = raft::make_host_matrix<IdxT, int64_t>(sorted_rows.size(), degree);
     static auto host_buffer = raft::make_pinned_matrix<IdxT, int64_t, raft::row_major>(handle, batch.size() * num_rev_edges, degree);
     static auto h_device_positions = raft::make_pinned_vector<IdxT>(handle, batch.size() * num_rev_edges);
     auto& graph_mapper = idx.get_graph_hd_mapper();
     graph_mapper.map_host_to_device_rows(handle, sorted_rows, h_device_positions.data_handle());
-#pragma omp parallel for
+// #pragma omp parallel for
     for (size_t i = 0; i < updated_size; i++) {
         uint32_t host_row = sorted_rows[i];
         uint32_t device_row = h_device_positions.data_handle()[i];
@@ -382,17 +386,21 @@ void add_node_core(
           degree
       );
 
-    cudaEventRecord(stop, raft::resource::get_cuda_stream(handle));
-    cudaEventSynchronize(stop);
-    float search_time, step2_time, step3_time, total_time;
-    cudaEventElapsedTime(&search_time, start, search_done);
-    cudaEventElapsedTime(&step2_time, search_done, step2_done);
-    cudaEventElapsedTime(&step3_time, step2_done, stop);
-    cudaEventElapsedTime(&total_time, start, stop);
-    RAFT_LOG_INFO("Search time taken: %f ms", search_time);
-    RAFT_LOG_INFO("Step 2 time taken: %f ms", step2_time);
-    RAFT_LOG_INFO("Step 3 time taken: %f ms", step3_time);
-    RAFT_LOG_INFO("Total time taken: %f ms", total_time);
+    // cudaEventRecord(stop, raft::resource::get_cuda_stream(handle));
+    // cudaEventSynchronize(stop);
+    // float tag1_time, search_time, step2_time, step3_time, update_time, total_time;
+    // cudaEventElapsedTime(&tag1_time, start, tag1);
+    // cudaEventElapsedTime(&search_time, tag1, search_done);
+    // cudaEventElapsedTime(&step2_time, search_done, step2_done);
+    // cudaEventElapsedTime(&step3_time, step2_done, step3_done);
+    // cudaEventElapsedTime(&update_time, step3_done, stop);
+    // cudaEventElapsedTime(&total_time, start, stop);
+    // RAFT_LOG_INFO("[add_node_core] Tag1 time taken: %f ms", tag1_time);
+    // RAFT_LOG_INFO("[add_node_core] Search time taken: %f ms", search_time);
+    // RAFT_LOG_INFO("[add_node_core] Step 2 time taken: %f ms", step2_time);
+    // RAFT_LOG_INFO("[add_node_core] Step 3 time taken: %f ms", step3_time);
+    // RAFT_LOG_INFO("[add_node_core] Update time taken: %f ms", update_time);
+    // RAFT_LOG_INFO("[add_node_core] Total time taken: %f ms", total_time);
 
     #ifdef FFANNS_TIME_LOG
     time_log << chunk_id << ","
@@ -423,7 +431,8 @@ void add_graph_nodes(
   raft::device_matrix_view<IdxT, int64_t> updated_d_graph_view,
   const cagra::extend_params& params,
   const std::size_t insert_position,
-  const std::size_t num_new_nodes)
+  const std::size_t num_new_nodes,
+  ffanns::neighbors::cagra::search_context<T, IdxT>* search_ctx = nullptr)
 {
   auto delete_bitset_ptr = index.get_delete_bitset_ptr();
   auto count_scalar = raft::make_device_scalar<int64_t>(handle, 0);
@@ -431,7 +440,7 @@ void add_graph_nodes(
   int64_t host_count = 0;
   raft::copy(&host_count, count_scalar.data_handle(), 1, raft::resource::get_cuda_stream(handle));
   raft::resource::sync_stream(handle);
-  RAFT_LOG_INFO("[add_graph_nodes] delete bitset count = %ld", delete_bitset_ptr->size() - host_count);
+  // RAFT_LOG_INFO("[add_graph_nodes] delete bitset count = %ld", delete_bitset_ptr->size() - host_count);
 
   assert(input_updated_dataset_view.extent(0) >= index.size());
   
@@ -443,17 +452,12 @@ void add_graph_nodes(
   const std::size_t degree               = index.graph_degree();
   const std::size_t dim                  = index.dim();
   const std::size_t stride               = input_updated_dataset_view.stride(0);
-  // const std::size_t max_chunk_size_      = params.max_chunk_size == 0 ? 1 : params.max_chunk_size;
-  const std::size_t max_chunk_size_      = 8192;
+  const std::size_t max_chunk_size_      = params.max_chunk_size == 0 ? 10000 : params.max_chunk_size;
+  // const std::size_t max_chunk_size_      = 10000;
   // TODO: In-place update for graph data
   // memcpy(updated_graph_view.data_handle(),
   //      index.graph().data_handle(),
   //      index.graph().size() * sizeof(IdxT));
-
-  memcpy(updated_in_edges_view.data_handle(),
-       index.host_in_edges().data_handle(),
-       index.host_in_edges().size() * sizeof(int));
-  
   memset(updated_in_edges_view.data_handle() + insert_position,  
        0,                                                           
        num_new_nodes * sizeof(int));    
@@ -472,13 +476,17 @@ void add_graph_nodes(
     index.get_delete_slots_ptr(),
     index.get_free_slots_ptr());
 
-  RAFT_LOG_INFO("Finish to load additional data");
+  // RAFT_LOG_INFO("Finish to load additional data");
 
   auto& mapper = internal_index.hd_mapper();
   auto& graph_mapper = internal_index.get_graph_hd_mapper();
   internal_index.update_d_graph(handle, index.d_graph());
   
   bool using_free_slots = insert_position != initial_dataset_size;
+  assert (num_new_nodes != 0);
+  // RAFT_LOG_INFO("[add_graph_nodes] num_new_nodes = %d", num_new_nodes);
+  uint32_t chunk_id = 0;
+  float sum_miss_rates = 0.0f;
   for (std::size_t additional_dataset_offset = 0; additional_dataset_offset < num_new_nodes;
        additional_dataset_offset += max_chunk_size_) {
     const auto actual_chunk_size =
@@ -515,22 +523,26 @@ void add_graph_nodes(
     auto updated_in_edges = raft::make_host_vector_view<int, std::int64_t>(
       updated_in_edges_view.data_handle(),
       batch_new_size);
+    auto updated_d_in_edges = raft::make_device_vector_view<int, std::int64_t>(
+      index.d_in_edges().data_handle(),
+      batch_new_size);
+    internal_index.update_in_edges(updated_in_edges, updated_d_in_edges);
 
     // TODO: addtional data on device
-    auto current_insert_position = insert_position + additional_dataset_offset;
+    std::size_t current_insert_position = insert_position + additional_dataset_offset;
     auto additional_dataset_view = raft::make_host_matrix_view<const T, std::int64_t>(
       input_updated_dataset_view.data_handle() +
         current_insert_position * stride,
       actual_chunk_size,
       dim);
-    uint32_t chunk_id = additional_dataset_offset / max_chunk_size_;
     neighbors::cagra::add_node_core<T, IdxT>(
       handle, internal_index, additional_dataset_view, updated_graph, 
-      updated_d_graph_view, updated_in_edges, chunk_id, current_insert_position);
-    RAFT_LOG_INFO("sizeof chunk = %lu, chunk_id = %u", actual_chunk_size, chunk_id);
+      updated_d_graph_view, updated_in_edges, chunk_id, current_insert_position, params, search_ctx);
+    // RAFT_LOG_INFO("sizeof chunk = %lu, chunk_id = %u", actual_chunk_size, chunk_id);
+    sum_miss_rates += mapper.miss_rate;
     
     auto d_in_edges = internal_index.d_in_edges();
-    raft::copy(d_in_edges->data() + current_insert_position,
+    raft::copy(d_in_edges.data_handle() + current_insert_position,
                 updated_in_edges.data_handle() + current_insert_position,
                 actual_chunk_size,
                 raft::resource::get_cuda_stream(handle));
@@ -582,41 +594,40 @@ void add_graph_nodes(
       delete_bitset->set(handle, flip_indices.view(), true);
     }
 
-    if ( (chunk_id + 1) % 200 == 0) {
-      // TODO: temp: 只在测试纯插入过程中需要定期更新old d_in_edges
-      auto d_in_edges = internal_index.d_in_edges();
-      raft::copy(d_in_edges->data() + initial_dataset_size,
-                 updated_in_edges.data_handle() + initial_dataset_size,
-                 additional_dataset_offset + actual_chunk_size,
-                 raft::resource::get_cuda_stream(handle));
-      // mapper.decay_recent_access(0.5, handle);
-    }
+    // if ( (chunk_id + 1) % 10 == 0) {
+    //   // TODO: temp: 只在测试纯插入过程中需要定期更新old d_in_edges
+    //   auto d_in_edges = internal_index.d_in_edges();
+    //   raft::copy(d_in_edges.data_handle() + initial_dataset_size,
+    //              updated_in_edges.data_handle() + initial_dataset_size,
+    //              additional_dataset_offset + actual_chunk_size,
+    //              raft::resource::get_cuda_stream(handle));
+    //   // mapper.decay_recent_access(0.5, handle);
+    // }
 
-  //   if ( (chunk_id + 1) % 180 == 0) {
+  //   if ( (chunk_id + 1) % 50 == 0 || (chunk_id + 1) % 50 == 1) {
   //     int* in_edges = updated_in_edges.data_handle();
-  //     size_t graph_size = updated_in_edges.size();
-  //     std::memset(in_edges, 0, graph_size * sizeof(int));
+  // //     size_t graph_size = updated_in_edges.size();
+  // //     std::memset(in_edges, 0, graph_size * sizeof(int));
       
-  // #pragma omp parallel for
-  //     for (size_t n = 0; n < graph_size; n++) {
-  //         for (size_t i = 0; i < degree; i++) {
-  //             auto neighbor = updated_graph(n, i);
-  // #pragma omp atomic
-  //             in_edges[neighbor]++;
-  //         }
-  //     }
+  // // #pragma omp parallel for
+  // //     for (size_t n = 0; n < graph_size; n++) {
+  // //         for (size_t i = 0; i < degree; i++) {
+  // //             auto neighbor = updated_graph(n, i);
+  // // #pragma omp atomic
+  // //             in_edges[neighbor]++;
+  // //         }
+  // //     }
 
   //     auto d_in_edges = internal_index.d_in_edges();
   //     std::string count_file_name = bench_config::instance().get_count_log_path(chunk_id+1);
   //     // mapper.snapshot_access_counts(count_file_name, updated_in_edges.data_handle(), raft::resource::get_cuda_stream(handle));
-  //     mapper.snapshot_access_counts(count_file_name, updated_in_edges.data_handle(), d_in_edges->data(), raft::resource::get_cuda_stream(handle));
+  //     mapper.snapshot_access_counts(count_file_name, updated_in_edges.data_handle(), d_in_edges.data_handle(), raft::resource::get_cuda_stream(handle));
   //   }
-
-    if ( (chunk_id + 1) % 30 == 0) {
-      mapper.decay_recent_access(0.5, handle);
-    }
+    mapper.decay_recent_access(0.667, handle);
+    chunk_id++;
   }
 
+  index.hd_mapper_ptr()->miss_rate = sum_miss_rates / chunk_id;
   index.update_d_graph(handle, internal_index.d_graph());
 }
 
@@ -631,7 +642,8 @@ void extend_core(
   std::optional<raft::device_matrix_view<T, int64_t, raft::layout_stride>> new_d_dataset_buffer_view,
   std::optional<raft::host_matrix_view<IdxT, int64_t, raft::layout_stride>> new_graph_buffer_view,
   std::optional<raft::device_matrix_view<IdxT, int64_t>> new_d_graph_buffer_view,
-  IdxT start_id, IdxT end_id)
+  IdxT start_id, IdxT end_id,
+  ffanns::neighbors::cagra::search_context<T, IdxT>* search_ctx = nullptr)
 {
   const std::size_t num_new_nodes        = additional_dataset.extent(0);
   const std::size_t initial_dataset_size = index.size();
@@ -729,21 +741,20 @@ void extend_core(
   assert(new_d_graph_buffer_view.has_value() && "new_d_graph_buffer_view must be provided");
   auto updated_d_graph_view = new_d_graph_buffer_view.value();
 
-  auto updated_in_edges = raft::make_host_vector<int, std::int64_t>(new_dataset_size);
+  auto host_in_edges = index.host_in_edges();
+  auto updated_in_edges = raft::make_host_vector_view<int, std::int64_t>(host_in_edges.data_handle(), new_dataset_size);
   auto d_in_edges = index.d_in_edges();
-  if (new_dataset_size > initial_dataset_size) {
-    d_in_edges->resize(new_dataset_size, raft::resource::get_cuda_stream(handle));
-  }
+  auto updated_d_in_edges = raft::make_device_vector_view<int, std::int64_t>(d_in_edges.data_handle(), new_dataset_size);
   thrust::fill(thrust::cuda::par.on(raft::resource::get_cuda_stream(handle)),
-               d_in_edges->begin() + insert_position,
-               d_in_edges->begin() + insert_position + num_new_nodes,
+               updated_d_in_edges.data_handle() + insert_position,
+               updated_d_in_edges.data_handle() + insert_position + num_new_nodes,
                0);
 
   // Add graph nodes
   ffanns::neighbors::cagra::add_graph_nodes<T, IdxT>(
     handle, raft::make_const_mdspan(updated_dataset_view), 
-    updated_d_dataset_view, index, updated_graph_view, updated_in_edges.view(), 
-    updated_d_graph_view, params, insert_position, num_new_nodes);
+    updated_d_dataset_view, index, updated_graph_view, updated_in_edges, 
+    updated_d_graph_view, params, insert_position, num_new_nodes, search_ctx);
 
   // Update index dataset
   // Note that we delete raft::make_const_mdspan for in-place update reservation
@@ -752,13 +763,12 @@ void extend_core(
   index.update_graph(handle, updated_graph_view);
   // index.own_graph(handle, updated_graph.view());
   // index.own_graph(std::move(updated_graph));
-  // TODO: update d_graph
-  index.own_in_edges(handle, updated_in_edges);
+  index.update_in_edges(updated_in_edges, updated_d_in_edges);
 
   auto tag_to_id = index.get_tag_to_id_ptr();
   assert(tag_to_id != nullptr && "tag_to_id must be provided");
   assert(start_id != 0 && end_id != 0 && start_id < end_id && "start_id and end_id must be provided");
-  RAFT_LOG_ERROR("[extend_core] start_id = %u, end_id = %u", start_id, end_id);
+  // RAFT_LOG_INFO("[extend_core] start_id = %u, end_id = %u", start_id, end_id);
 
   if (tag_to_id->size() < new_dataset_size) {
     tag_to_id->resize(new_dataset_size, raft::resource::get_cuda_stream(handle));

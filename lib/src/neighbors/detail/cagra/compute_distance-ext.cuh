@@ -85,6 +85,7 @@ auto dataset_descriptor_init(const cagra::search_params& params,
   if (init == nullptr || priority < 0) {
     RAFT_FAIL("No dataset descriptor instance compiled for this parameter combination.");
   }
+  // RAFT_LOG_INFO("Using metric = %d", static_cast<int>(metric));
   return init(params, dataset, d_dataset, metric);
 }
 

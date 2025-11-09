@@ -1,0 +1,25 @@
+wikipedia:
+  max_pts: 2000000
+  res_path: /data/workspace/svfusion/results/streaming_test/
+  qps: 250.0
+  batch_size: 4
+  1:
+    operation: insert
+    start: 0
+    end: 1000000
+  
+  2:
+    operation: search
+    qps: 30
+    k: 10
+  
+  # 3:
+  #   operation: insert  
+  #   start: 10000
+  #   end: 20000
+  #   qps: 300.0
+    
+  # 4:
+  #   operation: search
+  #   qps: 2000.0
+  #   k: 64

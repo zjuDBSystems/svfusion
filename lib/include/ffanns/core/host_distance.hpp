@@ -1,3 +1,6 @@
+// Prevent multiple inclusions across and within translation units
+#pragma once
+
 #include <immintrin.h>
 #include <cmath>
 #include <cstdint>
@@ -360,7 +363,7 @@ inline float inner_product_avx2(const float* a,
     RAFT_LOG_INFO("[inner_product_avx2] AVX2 not supported !!!");
     /* -------- 标量回退 -------- */
     float result = 0.f;
-    for (uint32_t i = 0; i < size; ++i) result += a[i] * b[i];
+        for (uint32_t i = 0; i < size; ++i) result += a[i] * b[i];
     return result;
 #endif
 }

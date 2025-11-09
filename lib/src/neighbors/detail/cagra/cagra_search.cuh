@@ -6,7 +6,6 @@
 #include "factory.cuh"
 #include "sample_filter_utils.cuh"
 #include "search_plan.cuh"
-#include "search_single_cta_inst.cuh"
 
 #include <raft/core/device_mdspan.hpp>
 #include <raft/core/host_mdspan.hpp>
@@ -63,10 +62,11 @@ void search_main_core(raft::resources const& res,
                       host_device_mapper* hd_mapper,
                       graph_hd_mapper* graph_hd_mapper,
                       CagraSampleFilterT sample_filter = CagraSampleFilterT(),
-                      int* in_edges = nullptr
-                      )
+                      int* in_edges = nullptr,
+                      float* miss_rate = nullptr,
+                      ffanns::neighbors::cagra::search_context<DataT, IndexT>* search_ctx = nullptr)
 {
-  RAFT_LOG_INFO("[search_main_core] Start search_main_core");
+  // RAFT_LOG_INFO("[search_main_core] Start search_main_core");
   RAFT_LOG_DEBUG("# dataset size = %lu, dim = %lu\n",
                  static_cast<size_t>(graph.extent(0)),
                  static_cast<size_t>(queries.extent(1)));
@@ -84,7 +84,7 @@ void search_main_core(raft::resources const& res,
   using CagraSampleFilterT_s = typename CagraSampleFilterT_Selector<CagraSampleFilterT>::type; 
   std::unique_ptr<search_plan_impl<DataT, IndexT, DistanceT, CagraSampleFilterT_s>> plan =
     factory<DataT, IndexT, DistanceT, CagraSampleFilterT_s>::create(
-      res, params, dataset_desc, queries.extent(1), graph.extent(1), topk);
+      res, params, dataset_desc, queries.extent(1), graph.extent(0), graph.extent(1), topk);
 
   plan->check(topk);
 
@@ -118,7 +118,9 @@ void search_main_core(raft::resources const& res,
             set_offset(sample_filter, qid),
             hd_mapper,
             graph_hd_mapper,
-            in_edges);
+            in_edges,
+            miss_rate,
+            search_ctx);
   }
 }
 
@@ -135,7 +137,8 @@ void search_main(raft::resources const& res,
                  raft::device_matrix_view<InternalIdxT, int64_t, raft::row_major> neighbors,
                  raft::device_matrix_view<DistanceT, int64_t, raft::row_major> distances,
                  CagraSampleFilterT sample_filter = CagraSampleFilterT(),
-                 bool external_flag = false)
+                 bool external_flag = false,
+                 ffanns::neighbors::cagra::search_context<T, InternalIdxT>* search_ctx = nullptr)
 {
   auto stream         = raft::resource::get_cuda_stream(res);
 
@@ -160,12 +163,12 @@ void search_main(raft::resources const& res,
   auto graph_hd_mapper_ptr = index.get_graph_hd_mapper_ptr();
   auto d_in_edges = index.d_in_edges();
   search_main_core<T, InternalIdxT, DistanceT, CagraSampleFilterT>(
-    res, params, desc, graph_internal, d_graph_internal, queries, host_queries, neighbors, distances, 
-    hd_mapper_ptr.get(), graph_hd_mapper_ptr.get(), sample_filter, d_in_edges.get()->data());
+    res, params, desc, graph_internal, d_graph_internal, queries, host_queries, neighbors, distances,
+    hd_mapper_ptr.get(), graph_hd_mapper_ptr.get(), sample_filter, d_in_edges.data_handle(), &hd_mapper_ptr->miss_rate, search_ctx);
 
   // tag_to_id
   if (external_flag) {
-    RAFT_LOG_INFO("[search_main] external_flag is set, mapping neighbors from internal to external ids!!!");
+    // RAFT_LOG_INFO("[search_main] external_flag is set, mapping neighbors from internal to external ids!!!");
     // map neighbors from internal to external ids
     auto num_queries = neighbors.extent(0);
     auto num_neighbors = neighbors.extent(1);
@@ -175,25 +178,27 @@ void search_main(raft::resources const& res,
     map_neighbors_kernel<<<numBlocks, block_size, 0, stream>>>(neighbors.data_handle(), d_mapping, num_queries, num_neighbors);
     cudaStreamSynchronize(stream);
   }
+
+  hd_mapper_ptr->decay_recent_access(0.2668, res);
   
-  static_assert(std::is_same_v<DistanceT, float>,
-                "only float distances are supported at the moment");
-  float* dist_out          = distances.data_handle();
-  const DistanceT* dist_in = distances.data_handle();
-  // We're converting the data from T to DistanceT during distance computation
-  // and divide the values by kDivisor. Here we restore the original scale.
-  constexpr float kScale = ffanns::spatial::knn::detail::utils::config<T>::kDivisor /
-                           ffanns::spatial::knn::detail::utils::config<DistanceT>::kDivisor;
-  // Todo: integrate ivf::detail::postprocess_distances
-  auto raft_metric = static_cast<raft::distance::DistanceType>(index.metric());
-  raft::neighbors::ivf::detail::postprocess_distances(dist_out,
-                                                      dist_in,
-                                                      raft_metric,
-                                                      distances.extent(0),
-                                                      distances.extent(1),
-                                                      kScale,
-                                                      true,
-                                                      raft::resource::get_cuda_stream(res));
+  // static_assert(std::is_same_v<DistanceT, float>,
+  //               "only float distances are supported at the moment");
+  // float* dist_out          = distances.data_handle();
+  // const DistanceT* dist_in = distances.data_handle();
+  // // We're converting the data from T to DistanceT during distance computation
+  // // and divide the values by kDivisor. Here we restore the original scale.
+  // constexpr float kScale = ffanns::spatial::knn::detail::utils::config<T>::kDivisor /
+  //                          ffanns::spatial::knn::detail::utils::config<DistanceT>::kDivisor;
+  // // Todo: integrate ivf::detail::postprocess_distances
+  // auto raft_metric = static_cast<raft::distance::DistanceType>(index.metric());
+  // raft::neighbors::ivf::detail::postprocess_distances(dist_out,
+  //                                                     dist_in,
+  //                                                     raft_metric,
+  //                                                     distances.extent(0),
+  //                                                     distances.extent(1),
+  //                                                     kScale,
+  //                                                     true,
+  //                                                     raft::resource::get_cuda_stream(res));
 }
 
 } // namespace ffanns::neighbors::cagra::detail

@@ -2,19 +2,16 @@
 
 #include "compute_distance-ext.cuh"
 #include "device_common.hpp"
-#include "hashmap.hpp"
 #include "search_plan.cuh"
-#include "utils.hpp"
-// TODO: This shouldn't be invoking anything from spatial/knn
 #include "../ann_utils.cuh"
 #include "../../../core/nvtx.hpp"
 
 #include "ffanns/distance/distance.hpp"
 #include "ffanns/neighbors/common.hpp"
-#include "ffanns/neighbors/hd_mapper.hpp"
-#include "ffanns/selection/select_k.hpp"
+#include "ffanns/neighbors/cagra.hpp"
 #include "topk_for_cagra/topk.h"  //todo replace with raft kernel
-#include "ffanns/core/host_distance.hpp"
+#include "ffanns/selection/select_k.hpp"   
+#include "search_utils.hpp"
 
 #include <raft/core/device_mdspan.hpp>
 #include <raft/core/logger.hpp>
@@ -23,393 +20,172 @@
 #include <raft/core/resources.hpp>
 #include <raft/util/cuda_rt_essentials.hpp>
 #include <raft/util/cudart_utils.hpp>
+#include <raft/core/pinned_mdarray.hpp>
 
 // RMM & Thrust 依赖
 #include <rmm/device_scalar.hpp>
 #include <rmm/device_uvector.hpp>
 #include <thrust/gather.h>
+#include <thrust/execution_policy.h>   // execution policy（par / par_nosync…）
+#include <thrust/sort.h>               // thrust::sort / stable_sort
+#include <thrust/unique.h>             // thrust::unique / unique_by_key
+#include <thrust/fill.h>               // thrust::fill  (若用到补位)
+#include <thrust/copy.h>  
 
 #include <algorithm>
-#include <cassert>
 #include <iostream>
 #include <memory>
 #include <numeric>
 #include <vector>
+#include <array>
 
 namespace ffanns::neighbors::cagra::detail {
 
 namespace multi_kernel_search {
 
-struct TimingAccumulator {
-  float total_kernel1_ratio = 0.0f;
-  float total_graph_transfer_ratio = 0.0f;
-  float total_kernel2_ratio = 0.0f;
-  float total_data_transfer_ratio = 0.0f;
-  float total_kernel3_ratio = 0.0f;
-  float total_time = 0.0f;
-  int num_iters = 0;
-  
-  void add(const float kernel1_ratio, const float graph_transfer_ratio, const float kernel2_ratio, const float data_transfer_ratio, const float kernel3_ratio, const float compute_time) {
-      total_kernel1_ratio += kernel1_ratio;
-      total_graph_transfer_ratio += graph_transfer_ratio;
-      total_kernel2_ratio += kernel2_ratio;
-      total_data_transfer_ratio += data_transfer_ratio;
-      total_kernel3_ratio += kernel3_ratio;
-      total_time += compute_time;
-      num_iters++;
-  }
-  
-  void print() const {
-    printf("[search_multi_kernel] 本轮search各阶段耗时占比：\n");
-    printf("  Kernel1: %f%%\n", total_kernel1_ratio / num_iters * 100);
-    printf("  Graph Transfer: %f%%\n", total_graph_transfer_ratio / num_iters * 100);
-    printf("  Kernel2: %f%%\n", total_kernel2_ratio / num_iters * 100);
-    printf("  Data Transfer: %f%%\n", total_data_transfer_ratio / num_iters * 100);
-    printf("  Kernel3: %f%%\n", total_kernel3_ratio / num_iters  * 100);
-  }
-
-  void print2() const {
-    printf("[search_multi_kernel] 本轮search各阶段耗时：\n");
-    printf("  Kernel1: %fms\n", total_kernel1_ratio);
-    printf("  Graph Transfer: %fms\n", total_graph_transfer_ratio);
-    printf("  Kernel2: %fms\n", total_kernel2_ratio);
-    printf("  Data Transfer: %fms\n", total_data_transfer_ratio);
-    printf("  Kernel3: %fms\n", total_kernel3_ratio);
-  }
-
-  std::tuple<float, float, float, float, float, float> get_ratios() const {
-    return std::make_tuple(
-      total_kernel1_ratio / num_iters,
-      total_graph_transfer_ratio / num_iters,
-      total_kernel2_ratio / num_iters,
-      total_data_transfer_ratio / num_iters,
-      total_kernel3_ratio / num_iters,
-      total_time
-    );
-  }
-};
-
-template <typename DataT, typename IndexT, typename DistanceT>
-struct ComputeDistanceContext {
-  host_device_mapper* hd_mapper;       // CPU-GPU 数据映射器
-  graph_hd_mapper* graph_mapper;       // 图数据映射器
-  size_t* hd_status;                   // CPU-GPU 状态统计
-  int* in_edges;                       // 输入边数据
-  // 存储 pinned memory 的底层指针
-  DistanceT* cpu_distances_ptr;        // Pinned memory for distances
-  IndexT* host_indices_ptr;            // Pinned memory for indices
-  unsigned int* query_miss_counter_ptr; // Pinned memory for miss counter
-  IndexT* host_graph_buffer_ptr;
-  unsigned iter = 0;
-  ffanns::distance::DistanceType metric;
-
-  ComputeDistanceContext(host_device_mapper* hd_mapper_ptr,
-                         graph_hd_mapper* graph_mapper_ptr,
-                         size_t* hd_status_ptr,
-                         int* in_edges_ptr,
-                         DistanceT* cpu_distances_ptr_,
-                         IndexT* host_indices_ptr_,
-                         unsigned int* query_miss_counter_ptr_,
-                         IndexT* host_graph_buffer_ptr_,
-                         unsigned iter_,
-                         ffanns::distance::DistanceType metric_)
-    : hd_mapper(hd_mapper_ptr),
-      graph_mapper(graph_mapper_ptr),
-      hd_status(hd_status_ptr),
-      in_edges(in_edges_ptr),
-      cpu_distances_ptr(cpu_distances_ptr_),
-      host_indices_ptr(host_indices_ptr_),
-      query_miss_counter_ptr(query_miss_counter_ptr_),
-      host_graph_buffer_ptr(host_graph_buffer_ptr_),
-      iter(iter_),
-      metric(metric_) 
-  {}
-};
-
-template<typename T>
-using HostDistFunc = float (*)(const T*, const T*, uint32_t);
-
-template<typename DataT>
-inline HostDistFunc<DataT>
-select_host_dist(ffanns::distance::DistanceType dt)
-{
-    switch (dt) {
-        case ffanns::distance::DistanceType::InnerProduct:
-            // RAFT_LOG_INFO("Using InnerProduct");
-            return static_cast<HostDistFunc<DataT>>(
-                       ffanns::core::neg_inner_product_avx2);
-        /* L2 和 L2Expanded 都走这条 */
-        default:
-            // RAFT_LOG_INFO("Using l2_distance");
-            return static_cast<HostDistFunc<DataT>>(
-                       ffanns::core::l2_distance_avx2);
-    }
-}
-
-__device__ inline uint32_t splitmix32(uint32_t x) {
-  x += 0x9e3779b9u;               // SplitMix32 一步即可
-  x = (x ^ (x >> 16)) * 0x85ebca6bu;
-  x = (x ^ (x >> 13)) * 0xc2b2ae35u;
-  return x ^ (x >> 16);
-}
-
-template <class T>
-RAFT_KERNEL set_value_kernel(T* const dev_ptr, const T val)
-{
-  *dev_ptr = val;
-}
-
-template <class T>
-RAFT_KERNEL set_value_kernel(T* const dev_ptr, const T val, const std::size_t count)
-{
-  const auto tid = threadIdx.x + blockIdx.x * blockDim.x;
-  if (tid >= count) { return; }
-  dev_ptr[tid] = val;
-}
-
-template <class T>
-void set_value(T* const dev_ptr, const T val, cudaStream_t cuda_stream)
-{
-  set_value_kernel<T><<<1, 1, 0, cuda_stream>>>(dev_ptr, val);
-}
-
-template <class T>
-void set_value(T* const dev_ptr, const T val, const std::size_t count, cudaStream_t cuda_stream)
-{
-  constexpr std::uint32_t block_size = 256;
-  const auto grid_size               = (count + block_size - 1) / block_size;
-  set_value_kernel<T><<<grid_size, block_size, 0, cuda_stream>>>(dev_ptr, val, count);
-}
-
-template <class T>
-RAFT_KERNEL set_value_batch_kernel(T* const dev_ptr,
-                                   const std::size_t ld,
-                                   const T val,
-                                   const std::size_t count,
-                                   const std::size_t batch_size)
-{
-  const auto tid = threadIdx.x + blockIdx.x * blockDim.x;
-  if (tid >= count * batch_size) { return; }
-  const auto batch_id              = tid / count;
-  const auto elem_id               = tid % count;
-  dev_ptr[elem_id + ld * batch_id] = val;
-}
-
-template <class T>
-void set_value_batch(T* const dev_ptr,
-                     const std::size_t ld,
-                     const T val,
-                     const std::size_t count,
-                     const std::size_t batch_size,
-                     cudaStream_t cuda_stream)
-{
-  constexpr std::uint32_t block_size = 256;
-  const auto grid_size               = (count * batch_size + block_size - 1) / block_size;
-  set_value_batch_kernel<T>
-    <<<grid_size, block_size, 0, cuda_stream>>>(dev_ptr, ld, val, count, batch_size);
-}
-
-template <class T>
-RAFT_KERNEL get_value_kernel(T* const host_ptr, const T* const dev_ptr)
-{
-  *host_ptr = *dev_ptr;
-}
-
-template <class T>
-void get_value(T* const host_ptr, const T* const dev_ptr, cudaStream_t cuda_stream)
-{
-  get_value_kernel<T><<<1, 1, 0, cuda_stream>>>(host_ptr, dev_ptr);
-}
-
-inline void check_pointer(const void* ptr, const char* name) {
-    cudaPointerAttributes attrs;
-    cudaError_t err = cudaPointerGetAttributes(&attrs, ptr);
-    if (err != cudaSuccess) {
-        RAFT_LOG_INFO("Error getting attributes for %s: %s\n", 
-               name, cudaGetErrorString(err));
-        return;
-    }
-    
-    RAFT_LOG_INFO("%s is on %s, value=%p\n", 
-           name,
-           attrs.type == cudaMemoryTypeDevice ? "device" : "host",
-           ptr);
-}
-
-template <typename DistanceT, typename IndexT>
-RAFT_KERNEL scatter_kernel(const DistanceT* __restrict__ src,
-                           DistanceT* __restrict__ dst,
-                           const IndexT* __restrict__ offsets,
-                           const int num)
-{
-    int tid = threadIdx.x + blockDim.x * blockIdx.x;
-    if (tid < num) {
-        // printf("tid=%d, src[tid]=%f, dst[tid]=%f, offsets[tid]=%d\n", tid, src[tid], dst[offsets[tid]], offsets[tid]);
-        if (offsets[tid] != utils::get_max_value<IndexT>()) {
-            dst[offsets[tid]] = src[tid];
-        }
-        // dst[offsets[tid]] = src[tid];
-    }
-}
-
-template <typename IndexT>
-RAFT_KERNEL graph_scatter_kernel(const IndexT* __restrict__ src_buffer,
-                           IndexT* __restrict__ dst_graph,
-                           const IndexT* __restrict__ device_indices,
-                           const uint32_t graph_degree,
-                           const uint32_t num_entries)
-{
-    int tid = threadIdx.x + blockDim.x * blockIdx.x;
-    if (tid >= num_entries) return;
-
-    const IndexT* src_row = src_buffer + tid * graph_degree;
-    IndexT* dst_row = dst_graph + device_indices[tid] * graph_degree;
-    for (uint32_t i = 0; i < graph_degree; i++) {
-      dst_row[i] = src_row[i];
-    }
-}
-
+// Merged random_pickup kernel - combines kernel1 and kernel2 functionality
+// This kernel strictly follows the original two-kernel logic but in a single launch
 template <class DATASET_DESCRIPTOR_T, class SAMPLE_FILTER_T>
-RAFT_KERNEL random_pickup_kernel1(
+RAFT_KERNEL random_pickup_kernel(
   const DATASET_DESCRIPTOR_T* dataset_desc,
   const typename DATASET_DESCRIPTOR_T::DATA_T* const queries_ptr,  // [num_queries, dataset_dim]
   const std::size_t num_pickup,
   const unsigned num_distilation,
   const uint64_t rand_xor_mask,
   const typename DATASET_DESCRIPTOR_T::INDEX_T* seed_ptr,  // [num_queries, num_seeds]
-  const std::uint32_t num_seeds,                 
+  const std::uint32_t num_seeds,
   typename DATASET_DESCRIPTOR_T::INDEX_T* const result_indices_ptr,       // [num_queries, ldr]
-  typename DATASET_DESCRIPTOR_T::INDEX_T* const d_result_indices_ptr,
-  const std::uint32_t ldr,                                                 // (*) ldr >= num_pickup
-  SAMPLE_FILTER_T sample_filter,
-  host_device_mapper* hd_mapper
-)
-{
-  assert(num_distilation == 1);
-  using INDEX_T    = typename DATASET_DESCRIPTOR_T::INDEX_T;
-
-  const auto global_team_index = blockIdx.x * blockDim.x + threadIdx.x;
-  const uint32_t query_id      = blockIdx.y;
-  const unsigned int max_attempts = 1000;
-  if (global_team_index >= num_pickup) { return; }
-
-  INDEX_T seed_index, final_seed_index, final_device_index;
-  unsigned int attempts = 0;
-  bool final_hit = false;
-  if (seed_ptr && (global_team_index < num_seeds)) {
-    seed_index = seed_ptr[global_team_index + (num_seeds * query_id)];
-  } else {
-    while(true) {
-      if (attempts >= max_attempts)
-        break;  
-      seed_index = device::xorshift64(global_team_index ^ (attempts << 8) ^ rand_xor_mask) % dataset_desc->size;
-      attempts ++;
-      if constexpr (!std::is_same<SAMPLE_FILTER_T,
-                  ffanns::neighbors::filtering::none_sample_filter>::value) {
-          if (!sample_filter(seed_index))
-          continue;   
-      }
-      auto [is_hit, dev_idx] = hd_mapper->get_wo_replace_safe(seed_index, false);
-      if (is_hit) {
-        final_hit = true;
-        final_seed_index = seed_index;
-        final_device_index = dev_idx;
-        break;  
-      }
-    }
-  }
-
-  const auto store_gmem_index = global_team_index + (ldr * query_id);
-  if (final_hit) {
-    result_indices_ptr[store_gmem_index] = final_seed_index;
-    d_result_indices_ptr[store_gmem_index] = final_device_index;
-  } else {
-    result_indices_ptr[store_gmem_index] = utils::get_max_value<INDEX_T>();;
-    d_result_indices_ptr[store_gmem_index] = utils::get_max_value<INDEX_T>();;
-  }
-}
-
-// MAX_DATASET_DIM : must equal to or greater than dataset_dim
-template <class DATASET_DESCRIPTOR_T>
-RAFT_KERNEL random_pickup_kernel2(
-  const DATASET_DESCRIPTOR_T* dataset_desc,
-  const typename DATASET_DESCRIPTOR_T::DATA_T* const queries_ptr,  // [num_queries, dataset_dim]
-  const std::size_t num_pickup,
-  typename DATASET_DESCRIPTOR_T::INDEX_T* const result_indices_ptr,       // [num_queries, ldr]
-  const typename DATASET_DESCRIPTOR_T::INDEX_T* const tmp_device_indices_ptr,  // [num_queries, ldr]
   typename DATASET_DESCRIPTOR_T::DISTANCE_T* const result_distances_ptr,  // [num_queries, ldr]
-  const std::uint32_t ldr,                                                // (*) ldr >= num_pickup
-  typename DATASET_DESCRIPTOR_T::INDEX_T* const visited_hashmap_ptr,  // [num_queries, 1 << bitlen]
-  const std::uint32_t hash_bitlen)
+  const std::uint32_t ldr,                                                 // (*) ldr >= num_pickup
+  typename DATASET_DESCRIPTOR_T::INDEX_T* const visited_hashmap_ptr,      // [num_queries, 1 << bitlen]
+  const std::uint32_t hash_bitlen,
+  SAMPLE_FILTER_T sample_filter,
+  host_device_mapper* hd_mapper,
+  const uint32_t smem_ws_size)  // Pass workspace size from host
 {
+  assert(num_distilation == 1);   
+  
   using DATA_T     = typename DATASET_DESCRIPTOR_T::DATA_T;
   using INDEX_T    = typename DATASET_DESCRIPTOR_T::INDEX_T;
   using DISTANCE_T = typename DATASET_DESCRIPTOR_T::DISTANCE_T;
 
   const auto team_size_bits    = dataset_desc->team_size_bitshift();
-  const auto ldb               = hashmap::get_size(hash_bitlen);
-  const auto global_team_index = (blockIdx.x * blockDim.x + threadIdx.x) >> team_size_bits;
-  const std::uint32_t query_id      = blockIdx.y;
+  const auto team_size          = 1u << team_size_bits;
+  const auto ldb                = hashmap::get_size(hash_bitlen);
+  const auto global_team_index  = (blockIdx.x * blockDim.x + threadIdx.x) >> team_size_bits;
+  const uint32_t query_id       = blockIdx.y;
+  
   if (global_team_index >= num_pickup) { return; }
+  
   extern __shared__ uint8_t smem[];
+  // CRITICAL: setup_workspace MUST use smem from the beginning
+  // It will copy descriptor struct and query vector starting at smem[0]
   dataset_desc = dataset_desc->setup_workspace(smem, queries_ptr, query_id);
-  __syncthreads();
-
-  const auto store_gmem_index = global_team_index + (ldr * query_id);
-  INDEX_T best_index_team_local = result_indices_ptr[store_gmem_index];
-  INDEX_T best_index_team_tmp = tmp_device_indices_ptr[store_gmem_index];
-  DISTANCE_T norm2 = dataset_desc->compute_distance(best_index_team_tmp, true);
-
-  if ((threadIdx.x & ((1u << team_size_bits) - 1u)) == 0) {
-    if (hashmap::insert(
-          visited_hashmap_ptr + (ldb * query_id), hash_bitlen, best_index_team_local)) {
-      result_distances_ptr[store_gmem_index] = norm2;
+  __syncthreads();  // Ensure all threads have the query data ready
+  
+  const uint32_t max_teams_per_block = blockDim.x >> team_size_bits;
+  auto* __restrict__ shared_seed_indices = reinterpret_cast<INDEX_T*>(smem + smem_ws_size);
+  auto* __restrict__ shared_device_indices = shared_seed_indices + max_teams_per_block;
+  const auto team_id_in_block = (threadIdx.x >> team_size_bits);
+  const auto lane_id = threadIdx.x & ((1u << team_size_bits) - 1u);
+  
+  INDEX_T selected_seed_index = utils::get_max_value<INDEX_T>();
+  INDEX_T selected_device_index = utils::get_max_value<INDEX_T>();
+  
+  if (lane_id == 0) {
+    const unsigned int max_attempts = 1000;
+    INDEX_T seed_index;
+    if (seed_ptr && (global_team_index < num_seeds)) {
+      seed_index = seed_ptr[global_team_index + (num_seeds * query_id)];
+      auto [is_hit, device_index] = hd_mapper->get_wo_replace_safe(seed_index, false);
+      if (is_hit) {
+        selected_seed_index = seed_index;
+        selected_device_index = device_index;
+      }
     } else {
+      // Random seed selection - exactly like kernel1's while loop
+      unsigned int attempts = 0;
+      while (true) {
+        if (attempts >= max_attempts)
+          break;
+      
+        seed_index = device::xorshift64(global_team_index ^ (attempts << 8) ^ rand_xor_mask) 
+                     % dataset_desc->size;
+        attempts++;
+        
+        if constexpr (!std::is_same<SAMPLE_FILTER_T, 
+                                    ffanns::neighbors::filtering::none_sample_filter>::value) {
+          if (!sample_filter(seed_index))
+            continue;
+        }
+        auto [is_hit, dev_idx] = hd_mapper->get_wo_replace_safe(seed_index, false);
+        if (is_hit) {
+          selected_seed_index = seed_index;
+          selected_device_index = dev_idx;
+          break;
+        }
+      }
+    }
+    // Store in shared memory (if not found, will store MAX_VALUE)
+    shared_seed_indices[team_id_in_block] = selected_seed_index;
+    shared_device_indices[team_id_in_block] = selected_device_index;
+  }
+  __syncwarp();
+  
+  selected_seed_index = shared_seed_indices[team_id_in_block];
+  selected_device_index = shared_device_indices[team_id_in_block];
+  const auto store_gmem_index = global_team_index + (ldr * query_id);
+  
+  if (selected_seed_index != utils::get_max_value<INDEX_T>()) {
+    DISTANCE_T computed_distance = dataset_desc->compute_distance(selected_device_index, true);
+    if (lane_id == 0) {
+      if (hashmap::insert(visited_hashmap_ptr + (ldb * query_id), hash_bitlen, selected_seed_index)) {
+        result_indices_ptr[store_gmem_index] = selected_seed_index;
+        result_distances_ptr[store_gmem_index] = computed_distance;
+      } else {
+        // Already visited - mark as invalid (like kernel2)
+        result_indices_ptr[store_gmem_index] = utils::get_max_value<INDEX_T>();
+        result_distances_ptr[store_gmem_index] = utils::get_max_value<DISTANCE_T>();
+      }
+    }
+  } else {
+    // No valid seed found in kernel1 phase - store MAX_VALUE
+    if (lane_id == 0) {
+      result_indices_ptr[store_gmem_index] = utils::get_max_value<INDEX_T>();
       result_distances_ptr[store_gmem_index] = utils::get_max_value<DISTANCE_T>();
-      result_indices_ptr[store_gmem_index]   = utils::get_max_value<INDEX_T>();
     }
   }
 }
 
-// MAX_DATASET_DIM : must be equal to or greater than dataset_dim
 template <typename DataT, typename IndexT, typename DistanceT, typename SAMPLE_FILTER_T>
 void random_pickup(const dataset_descriptor_host<DataT, IndexT, DistanceT>& dataset_desc,
-                   const DataT* queries_ptr,  // [num_queries, dataset_dim]
-                   std::size_t num_queries,
-                   std::size_t num_pickup,
-                   unsigned num_distilation,
-                   uint64_t rand_xor_mask,
-                   const IndexT* seed_ptr,  // [num_queries, num_seeds]
-                   std::uint32_t num_seeds,
-                   IndexT* result_indices_ptr,       // [num_queries, ldr]
-                   DistanceT* result_distances_ptr,  // [num_queries, ldr]
-                   std::size_t ldr,                  // (*) ldr >= num_pickup
-                   IndexT* visited_hashmap_ptr,      // [num_queries, 1 << bitlen]
-                   std::uint32_t hash_bitlen,
-                   SAMPLE_FILTER_T sample_filter,
-                   host_device_mapper* hd_mapper,
-                   std::size_t *hd_status,
-                   IndexT* d_result_indices_ptr,
-                   cudaStream_t cuda_stream)
+                         const DataT* queries_ptr,
+                         std::size_t num_queries,
+                         std::size_t num_pickup,
+                         unsigned num_distilation,
+                         uint64_t rand_xor_mask,
+                         const IndexT* seed_ptr,
+                         std::uint32_t num_seeds,
+                         IndexT* result_indices_ptr,
+                         DistanceT* result_distances_ptr,
+                         std::size_t ldr,
+                         IndexT* visited_hashmap_ptr,
+                         std::uint32_t hash_bitlen,
+                         SAMPLE_FILTER_T sample_filter,
+                         host_device_mapper* hd_mapper,
+                         cudaStream_t cuda_stream)
 {
-#ifdef FFANNS_DEBUG_LOG
-  cudaEvent_t start, stop, kernel1_end, data_transfer;
-  cudaEventCreate(&start);
-  cudaEventCreate(&stop); 
-  cudaEventCreate(&kernel1_end);
-  cudaEventCreate(&data_transfer);
-  cudaEventRecord(start, cuda_stream);
-#endif
-
-  const auto block_size                = 256u;
+  const auto block_size = 256u;
   const auto num_teams_per_threadblock = block_size / dataset_desc.team_size;
-  const dim3 grid_size1((num_pickup + block_size - 1) / block_size, num_queries);
   const dim3 grid_size((num_pickup + num_teams_per_threadblock - 1) / num_teams_per_threadblock,
                        num_queries);
-  // RAFT_LOG_INFO("[random_pickup] block_size: %u, num_teams_per_threadblock: %u, num_pickup: %u,  grid_size: (%u, %u)", block_size, num_teams_per_threadblock, num_pickup, grid_size1.x, grid_size1.y);
-  // check_pointer(hd_mapper, "hd_mapper");
   
-  random_pickup_kernel1<<<grid_size1, block_size, dataset_desc.smem_ws_size_in_bytes, cuda_stream>>>(
+  // Calculate shared memory size
+  // Need space for: 2 * max_teams_per_block * sizeof(IndexT) + dataset workspace
+  const size_t shared_indices_size = 2 * num_teams_per_threadblock * sizeof(IndexT);
+  const size_t total_smem_size = shared_indices_size + dataset_desc.smem_ws_size_in_bytes;
+  
+  random_pickup_kernel<<<grid_size, block_size, total_smem_size, cuda_stream>>>(
     dataset_desc.dev_ptr(cuda_stream),
     queries_ptr,
     num_pickup,
@@ -418,48 +194,15 @@ void random_pickup(const dataset_descriptor_host<DataT, IndexT, DistanceT>& data
     seed_ptr,
     num_seeds,
     result_indices_ptr,
-    d_result_indices_ptr,
-    ldr,
-    sample_filter,
-    hd_mapper
-  );
-  
-#ifdef FFANNS_DEBUG_LOG
-  cudaEventRecord(kernel1_end, cuda_stream);
-#endif
-  RAFT_CUDA_TRY(cudaStreamSynchronize(cuda_stream));
-
-#ifdef FFANNS_DEBUG_LOG
-  cudaEventRecord(data_transfer, cuda_stream);
-  cudaEventSynchronize(data_transfer);
-#endif 
-  RAFT_CUDA_TRY(cudaStreamSynchronize(cuda_stream));
-  
-  random_pickup_kernel2<<<grid_size, block_size, dataset_desc.smem_ws_size_in_bytes, cuda_stream>>>(
-    dataset_desc.dev_ptr(cuda_stream),
-    queries_ptr,
-    num_pickup,
-    result_indices_ptr,
-    d_result_indices_ptr,
     result_distances_ptr,
     ldr,
     visited_hashmap_ptr,
-    hash_bitlen);
-  
-#ifdef FFANNS_DEBUG_LOG
-  cudaEventRecord(stop, cuda_stream);
-  cudaEventSynchronize(stop);
-  float kernel1_time, data_transfer_time, kernel2_time, total_time;
-  cudaEventElapsedTime(&kernel1_time, start, kernel1_end);
-  cudaEventElapsedTime(&data_transfer_time, kernel1_end, data_transfer);
-  cudaEventElapsedTime(&kernel2_time, data_transfer, stop);
-  cudaEventElapsedTime(&total_time, start, stop);
-  // RAFT_LOG_INFO("[random_pickup] Kernel1 time taken: %f us", kernel1_time * 1000);
-  // RAFT_LOG_INFO("[random_pickup] Data transfer time taken: %f us", data_transfer_time * 1000);
-  // RAFT_LOG_INFO("[random_pickup] Kernel2 time taken: %f us", kernel2_time * 1000);
-  // RAFT_LOG_INFO("[random_pickup] Total time taken: %f ms", total_time);
-#endif
-
+    hash_bitlen,
+    sample_filter,
+    hd_mapper,
+    dataset_desc.smem_ws_size_in_bytes);  // Pass the workspace size
+    
+  RAFT_CUDA_TRY(cudaPeekAtLastError());
 }
 
 template <class INDEX_T>
@@ -498,9 +241,10 @@ RAFT_KERNEL pickup_next_parents_kernel(
           new_parent = 1;
         }
       }
-      const std::uint32_t ballot_mask = __ballot_sync(0xffffffff, new_parent);
+      const std::uint32_t ballot_mask = __ballot_sync(0xffffffffu, new_parent);
       if (new_parent) {
-        const auto i = __popc(ballot_mask & ((1 << threadIdx.x) - 1)) + num_new_parents;
+        // Use unsigned shift to avoid undefined behavior when threadIdx.x == 31
+        const auto i = __popc(ballot_mask & ((1u << threadIdx.x) - 1u)) + num_new_parents;
         if (i < parent_list_size) {
           parent_list_ptr[i + (ldd * query_id)] = j;
           parent_candidates_ptr[j + (lds * query_id)] |=
@@ -628,13 +372,12 @@ RAFT_KERNEL compute_distance_to_child_nodes_kernel1(
     miss_device_graphids[pos] = device_parent_index;
   }
 
-  // if (is_hit) {
+  // if (is_hit) 
   for (uint32_t idx = 0; idx < graph_degree; idx++) {
     const size_t result_idx = query_id * ldd + local_search_id * graph_degree + idx;
     const size_t child_id_offset = device_parent_index * graph_degree + idx;
     result_indices_ptr[result_idx] = child_id_offset;
-  }
-  // }  
+  } 
 }
 
 template <class DATASET_DESCRIPTOR_T, class SAMPLE_FILTER_T>
@@ -662,8 +405,10 @@ RAFT_KERNEL compute_distance_to_child_nodes_kernel2(
   unsigned int* const miss_counter1_vec,
   unsigned int* const miss_counter1,
   unsigned int* const miss_counter2,
+  unsigned int* const miss_counter2_write,
   int* const in_edges,
-  unsigned int iter)
+  unsigned int iter,
+  bool is_internal_search)
 {
   using INDEX_T    = typename DATASET_DESCRIPTOR_T::INDEX_T;
   using DISTANCE_T = typename DATASET_DESCRIPTOR_T::DISTANCE_T;
@@ -679,27 +424,30 @@ RAFT_KERNEL compute_distance_to_child_nodes_kernel2(
   const std::size_t result_idx = ldd * query_id + global_team_id;
   const std::size_t child_id_offset = result_indices_ptr[result_idx];
   if (child_id_offset == utils::get_max_value<INDEX_T>()) {
+    compute_distance_flags_ptr[result_idx] = 0;
     return;
   }
   const std::size_t child_id = neighbor_graph_ptr[child_id_offset];
   result_indices_ptr[result_idx] = child_id;
-  // const std::size_t child_id = result_indices_ptr[result_idx];
-  const auto miss_counter_offset = query_id * search_width * graph_degree;
-
-  // if (child_id == utils::get_max_value<INDEX_T>()) {
-  //   return;
-  // }
-
+  // !!! remove filter in internal iteration
   if constexpr (!std::is_same<SAMPLE_FILTER_T,
                               ffanns::neighbors::filtering::none_sample_filter>::value) {
-    if (!sample_filter(child_id)) {
-      // printf("[compute_distance_to_child_nodes_kernel2] child_id filtered!");
+    if (is_internal_search && (!sample_filter(child_id))) {
       result_distances_ptr[result_idx] = utils::get_max_value<DISTANCE_T>();
       compute_distance_flags_ptr[result_idx] = 0;
       return;
     }
+    // test relax
+    // if (!is_internal_search && (iter > 100) && (!sample_filter(child_id))) {
+    //   result_distances_ptr[result_idx] = utils::get_max_value<DISTANCE_T>();
+    //   compute_distance_flags_ptr[result_idx] = 0;
+    //   return;
+    // }
   }
 
+  const auto miss_counter_offset = query_id * search_width * graph_degree;
+  // auto max_transfer_size = is_internal_search ? 4096 : 3072;
+  auto max_transfer_size = 4096;
   const auto compute_distance_flag = hashmap::insert<INDEX_T>(
     visited_hashmap_ptr + (ldb * blockIdx.y), hash_bitlen, child_id);
 
@@ -723,28 +471,45 @@ RAFT_KERNEL compute_distance_to_child_nodes_kernel2(
       //     return;
       //   }
       // }
-      unsigned int pos = atomicAdd(&miss_counter1_vec[query_id], 1);
-      atomicAdd(miss_counter1, 1);
-      miss_host_indices1[miss_counter_offset + pos] = child_id;
-      miss_result_idx_offsets[miss_counter_offset + pos] = result_idx;
-      compute_distance_flags_ptr[result_idx] = 0;
-      // auto result = hd_mapper->replace(child_id, in_edges);
-      // is_hit = result.first;
-      // device_index = result.second;
-      // // is_hit = false;
-      // // better to not replace
-      // if (!is_hit) {
-      //   unsigned int pos = atomicAdd(&miss_counter1_vec[query_id], 1);
-      //   atomicAdd(miss_counter1, 1);
-      //   miss_host_indices1[miss_counter_offset + pos] = child_id;
-      //   miss_result_idx_offsets[miss_counter_offset + pos] = result_idx;
-      //   // Set distance flgas as 0 to avoid computing on device
-      //   compute_distance_flags_ptr[result_idx] = 0;
-      // } else { // sucessfully replaced
-      //   unsigned int pos = atomicAdd(miss_counter2, 1);
-      //   miss_host_indices2[pos] = child_id;
-      //   miss_device_indices[pos] = device_index;
-      // }
+      // CPU offloading implementation
+      // unsigned int pos1 = atomicAdd(&miss_counter1_vec[query_id], 1);
+      // atomicAdd(miss_counter1, 1);
+      // miss_host_indices1[miss_counter_offset + pos1] = child_id;
+      // miss_result_idx_offsets[miss_counter_offset + pos1] = result_idx;
+      // compute_distance_flags_ptr[result_idx] = 0;
+      
+      // LRU implementation
+      // unsigned int pos2 = atomicAdd(miss_counter2_write, 1);
+      // atomicAdd(miss_counter2, 1);
+      // miss_host_indices2[pos2] = child_id;
+      // miss_device_indices[pos2] = device_index;
+
+      unsigned int tmp_pos2 = atomicAdd(miss_counter2, 1);
+      if (tmp_pos2 >= max_transfer_size-1) {
+        // directly reduce to cpu computation
+        atomicSub(miss_counter2, 1);
+        unsigned int pos1 = atomicAdd(&miss_counter1_vec[query_id], 1);
+        atomicAdd(miss_counter1, 1);
+        miss_host_indices1[miss_counter_offset + pos1] = child_id;
+        miss_result_idx_offsets[miss_counter_offset + pos1] = result_idx;
+        compute_distance_flags_ptr[result_idx] = 0;
+      } else {
+        auto result = hd_mapper->replace(child_id, in_edges, is_internal_search);
+        is_hit = result.first;
+        device_index = result.second;
+        if (!is_hit) {
+          atomicSub(miss_counter2, 1);
+          unsigned int pos1 = atomicAdd(&miss_counter1_vec[query_id], 1);
+          atomicAdd(miss_counter1, 1);
+          miss_host_indices1[miss_counter_offset + pos1] = child_id;
+          miss_result_idx_offsets[miss_counter_offset + pos1] = result_idx;
+          compute_distance_flags_ptr[result_idx] = 0;
+        } else { // sucessfully replaced
+          unsigned int pos2 = atomicAdd(miss_counter2_write, 1);
+          miss_host_indices2[pos2] = child_id;
+          miss_device_indices[pos2] = device_index;
+        }
+      }
     }
     // !!! debugging
     d_result_indices_ptr[result_idx] = device_index;
@@ -783,16 +548,15 @@ RAFT_KERNEL compute_distance_to_child_nodes_kernel3(
   __syncthreads();
   if (global_team_id >= search_width * graph_degree) { return; }
 
-  const auto compute_distance_flag = compute_distance_flags_ptr[ldd * blockIdx.y + global_team_id];
+  const auto result_idx            = ldd * blockIdx.y + global_team_id;
+  const auto compute_distance_flag = compute_distance_flags_ptr[result_idx];
 
-  if (compute_distance_flag) {
-    const std::size_t tmp_child_id = tmp_result_indices_ptr[ldd * blockIdx.y + global_team_id];
-    DISTANCE_T norm2 = dataset_desc->compute_distance(tmp_child_id, compute_distance_flag);
-    if ((threadIdx.x & (team_size - 1)) == 0) {
-      result_distances_ptr[ldd * blockIdx.y + global_team_id] = norm2;
-    }
-  } else {
-    return;
+  if (!compute_distance_flag) { return; }
+
+  const std::size_t tmp_child_id = tmp_result_indices_ptr[result_idx];
+  DISTANCE_T norm2               = dataset_desc->compute_distance(tmp_child_id, compute_distance_flag);
+  if ((threadIdx.x & (team_size - 1)) == 0) {
+    result_distances_ptr[result_idx] = norm2;
   }
 }
 
@@ -844,15 +608,13 @@ void compute_distance_to_child_nodes(
   const auto block_size      = 128;
   const auto teams_per_block = block_size / dataset_desc.team_size;
   
-  const dim3 grid_size((search_width * graph_degree + teams_per_block - 1) / teams_per_block,
-                       num_queries);  
   const auto grid_size1 = (num_queries * search_width + block_size - 1) / block_size;
   const dim3 grid_size2((search_width * graph_degree + block_size - 1) / block_size, num_queries);
-  // const int grid_size1  = (search_width * num_queries + block_size - 1) / block_size;
+  const dim3 grid_size3((search_width * graph_degree + teams_per_block - 1) / teams_per_block,
+                       num_queries);  
 
   std::vector<uint8_t> host_compute_distance_flags(num_queries * ldd);
   rmm::device_uvector<uint8_t> compute_distance_flags(num_queries * ldd, cuda_stream);
-
   rmm::device_scalar<unsigned int> graph_miss_counter(0, cuda_stream);
   rmm::device_uvector<IndexT> miss_host_graphids(num_queries * search_width, cuda_stream);
   rmm::device_uvector<IndexT> miss_device_graphids(num_queries * search_width, cuda_stream);
@@ -891,7 +653,9 @@ void compute_distance_to_child_nodes(
     //   RAFT_LOG_INFO("[compute_distance_to_child_nodes] !!!num_graph_miss: %u", num_graph_miss);
     // }
     for (size_t i = 0; i < num_graph_miss; i++) {
-        const IndexT* neighbor_list_head = neighbor_graph_ptr + host_graphids[i] * graph_degree;
+        size_t miss_graph_id = host_graphids[i];
+        // RAFT_LOG_INFO("[compute_distance_to_child_nodes] miss_graph_id: %u", miss_graph_id);
+        const IndexT* neighbor_list_head = neighbor_graph_ptr + miss_graph_id * graph_degree;
         memcpy(host_graph_buffer + i * graph_degree, neighbor_list_head, graph_degree * sizeof(IndexT));
     }
     raft::copy(device_graph_buffer.data(), host_graph_buffer, num_graph_miss * graph_degree, cuda_stream);
@@ -914,6 +678,7 @@ void compute_distance_to_child_nodes(
   thrust::fill(thrust::cuda::par.on(cuda_stream), miss_counter1_vec.begin(), miss_counter1_vec.end(), 0u);
   rmm::device_scalar<unsigned int> miss_counter1(0, cuda_stream);
   rmm::device_scalar<unsigned int> miss_counter2(0, cuda_stream);
+  rmm::device_scalar<unsigned int> miss_counter2_write(0, cuda_stream);
   rmm::device_uvector<IndexT> miss_host_indices1(num_queries * search_width * graph_degree, cuda_stream);
   rmm::device_uvector<IndexT> result_idx_offsets(num_queries * search_width * graph_degree, cuda_stream);
   thrust::fill(thrust::cuda::par.on(cuda_stream), result_idx_offsets.begin(), result_idx_offsets.end(), utils::get_max_value<IndexT>());
@@ -943,8 +708,10 @@ void compute_distance_to_child_nodes(
                                                           miss_counter1_vec.data(),
                                                           miss_counter1.data(),
                                                           miss_counter2.data(),
+                                                          miss_counter2_write.data(),
                                                           compute_ctx->in_edges,
-                                                          compute_ctx->iter);
+                                                          compute_ctx->iter,
+                                                          compute_ctx->is_internal_search);
   
 #ifdef FFANNS_DEBUG_LOG
   cudaEventRecord(kernel2_end, cuda_stream);
@@ -953,27 +720,8 @@ void compute_distance_to_child_nodes(
 
   // !!! debugging
   unsigned int num_miss1 = miss_counter1.value(cuda_stream);
-  // cudaStream_t stream_host_comp = nullptr;
-  // cudaStream_t stream_device_comp = nullptr;
-  // if (res.has_resource_factory(raft::resource::resource_type::CUDA_STREAM_POOL)) {
-  //   size_t pool_size = raft::resource::get_stream_pool_size(res);
-  //   if (pool_size >= 2) {  
-  //       stream_host_comp = raft::resource::get_stream_from_stream_pool(res, 0);
-  //       stream_device_comp = raft::resource::get_stream_from_stream_pool(res, 1);
-  //   } else {
-  //       RAFT_LOG_INFO("CUDA stream pool size (%zu) is insufficient. Requires at least 2 streams.", pool_size);
-  //   }
-  // } else {
-  //   RAFT_LOG_INFO("CUDA stream pool resource not found.");
-  // }
-  // rmm::device_uvector<DistanceT> tmp_device_distances(num_miss1, cuda_stream);
   rmm::device_uvector<DistanceT> tmp_device_distances(num_queries * search_width * graph_degree, cuda_stream);
   if (num_miss1 > 0) {
-    // std::vector<DistanceT> cpu_distances(num_miss1);
-    // std::vector<IndexT> host_indices(num_miss1);
-    // std::vector<IndexT> host_result_idx_offsets(num_miss1);
-    // raft::copy(host_indices.data(), miss_host_indices1.data(), num_miss1, cuda_stream);
-    // raft::copy(host_result_idx_offsets.data(), result_idx_offsets.data(), num_miss1, cuda_stream);
     auto cpu_distances =  compute_ctx->cpu_distances_ptr;
     auto host_indices = compute_ctx->host_indices_ptr;
     auto query_miss_counter = compute_ctx->query_miss_counter_ptr;
@@ -990,46 +738,47 @@ void compute_distance_to_child_nodes(
       const DataT* child_data;
       for (size_t j = 0; j < num_miss; j++) {
         size_t idx = query_offset + j;
-        child_data = dataset_desc.ptr + host_indices[idx] * dataset_desc.stride;
+        size_t miss_child_id = host_indices[idx];
+        child_data = dataset_desc.ptr + miss_child_id * dataset_desc.stride;
         // cpu_distances[idx] = ffanns::core::l2_distance_avx2(query_data, child_data, dataset_desc.stride); 
         cpu_distances[idx] = host_dist_fn(query_data, child_data, dataset_desc.stride);
       }
     }
     raft::copy(tmp_device_distances.data(), cpu_distances, num_queries * search_width * graph_degree, cuda_stream);   
-    
-// #pragma omp parallel for num_threads(32) schedule(static)
-//     for (size_t i = 0; i < num_miss1; i++) {
-//       const DataT* child_data = dataset_desc.ptr + host_indices[i] * dataset_desc.stride;
-//       size_t query_id = host_result_idx_offsets[i] / ldd;
-//       const DataT* query_data = host_query_ptr + query_id * dataset_desc.stride;
-//       cpu_distances[i] = ffanns::core::l2_distance_avx512(query_data, child_data, dataset_desc.stride);
-//       //cpu_distances[i] = 0.02;
-//     }
-//     raft::copy(tmp_device_distances.data(), cpu_distances.data(), num_miss1, cuda_stream);                                            
+  
     compute_ctx->hd_status[0] += num_miss1;
   }
 
   unsigned int num_miss2 = miss_counter2.value(cuda_stream);
+  unsigned int test_num_miss2 = miss_counter2_write.value(cuda_stream);
+  assert(num_miss2 == test_num_miss2);
   if (num_miss2 > 0) {
       // if (num_miss2 > 1000) {
       //   RAFT_LOG_INFO("[compute_distance_to_child_nodes] !!!num_miss2: %u", num_miss2);
       // }
       std::vector<IndexT> host_indices(num_miss2);
-      std::vector<IndexT> device_indices(num_miss2);
-      
-      // 复制miss信息到host
+      // std::vector<IndexT> device_indices(num_miss2);
       raft::copy(host_indices.data(), miss_host_indices2.data(), num_miss2, cuda_stream);
-      raft::copy(device_indices.data(), miss_device_indices.data(), num_miss2, cuda_stream);
+      // raft::copy(device_indices.data(), miss_device_indices.data(), num_miss2, cuda_stream);
+      auto host_vector_buffer = compute_ctx->host_vector_buffer_ptr;
+      auto device_vector_buffer = 
+          raft::make_device_matrix<DataT, int64_t, raft::row_major>(res,
+                                                                    num_miss2,
+                                                                    dataset_desc.stride);
       
-      // // 传输数据
       for (size_t i = 0; i < num_miss2; i++) {
-          raft::copy(
-              const_cast<DataT*>(dataset_desc.dd_ptr) + device_indices[i] * dataset_desc.stride,
-              dataset_desc.ptr + host_indices[i] * dataset_desc.stride,
-              dataset_desc.stride,
-              cuda_stream
-          );
+          size_t miss_child_id = host_indices[i];
+          const DataT* child_data = dataset_desc.ptr + miss_child_id * dataset_desc.stride;
+          memcpy(host_vector_buffer + i * dataset_desc.stride, child_data, dataset_desc.stride * sizeof(DataT));
       }
+      raft::copy(device_vector_buffer.data_handle(), host_vector_buffer, num_miss2 * dataset_desc.stride, cuda_stream);
+      int threadsPerBlock = 128;
+      int blocks = (num_miss2 + threadsPerBlock - 1) / threadsPerBlock;
+      data_scatter_kernel<<<blocks, threadsPerBlock, 0, cuda_stream>>>(device_vector_buffer.data_handle(),
+                                                              const_cast<DataT*>(dataset_desc.dd_ptr),
+                                                              miss_device_indices.data(),
+                                                              dataset_desc.stride,
+                                                              num_miss2);
       compute_ctx->hd_status[0] += num_miss2;
   }
   compute_ctx->hd_status[1] += num_queries * search_width * graph_degree;
@@ -1040,7 +789,7 @@ void compute_distance_to_child_nodes(
 #endif
   RAFT_CUDA_TRY(cudaStreamSynchronize(cuda_stream));
 
-  compute_distance_to_child_nodes_kernel3<<<grid_size,
+  compute_distance_to_child_nodes_kernel3<<<grid_size3,
                                            block_size,
                                            dataset_desc.smem_ws_size_in_bytes,
                                            cuda_stream>>>(search_width,
@@ -1081,110 +830,6 @@ void compute_distance_to_child_nodes(
   // RAFT_LOG_INFO("[compute_distance_to_child_nodes] Data transfer time taken: %f us", data_transfer_time * 1000);
   // RAFT_LOG_INFO("[compute_distance_to_child_nodes] Kernel3 time taken: %f us", kernel3_time * 1000);
   // RAFT_LOG_INFO("[compute_distance_to_child_nodes] Total time taken: %f us", total_time * 1000);
-}
-
-template <class INDEX_T>
-RAFT_KERNEL remove_parent_bit_kernel(const std::uint32_t num_queries,
-                                     const std::uint32_t num_topk,
-                                     INDEX_T* const topk_indices_ptr,  // [ld, num_queries]
-                                     const std::uint32_t ld)
-{
-  constexpr INDEX_T index_msb_1_mask = utils::gen_index_msb_1_mask<INDEX_T>::value;
-
-  uint32_t i_query = blockIdx.x;
-  if (i_query >= num_queries) return;
-
-  for (unsigned i = threadIdx.x; i < num_topk; i += blockDim.x) {
-    topk_indices_ptr[i + (ld * i_query)] &= ~index_msb_1_mask;  // clear most significant bit
-  }
-}
-
-template <class INDEX_T>
-void remove_parent_bit(const std::uint32_t num_queries,
-                       const std::uint32_t num_topk,
-                       INDEX_T* const topk_indices_ptr,  // [ld, num_queries]
-                       const std::uint32_t ld,
-                       cudaStream_t cuda_stream = 0)
-{
-  const std::size_t grid_size  = num_queries;
-  const std::size_t block_size = 256;
-  remove_parent_bit_kernel<<<grid_size, block_size, 0, cuda_stream>>>(
-    num_queries, num_topk, topk_indices_ptr, ld);
-}
-
-// This function called after the `remove_parent_bit` function
-template <class INDEX_T, class DISTANCE_T, class SAMPLE_FILTER_T>
-RAFT_KERNEL apply_filter_kernel(INDEX_T* const result_indices_ptr,
-                                DISTANCE_T* const result_distances_ptr,
-                                const std::size_t lds,
-                                const std::uint32_t result_buffer_size,
-                                const std::uint32_t num_queries,
-                                SAMPLE_FILTER_T sample_filter)
-{
-  constexpr INDEX_T index_msb_1_mask = utils::gen_index_msb_1_mask<INDEX_T>::value;
-  const auto tid                     = threadIdx.x + blockIdx.x * blockDim.x;
-  if (tid >= result_buffer_size * num_queries) { return; }
-  const auto i     = tid % result_buffer_size;
-  const auto j     = tid / result_buffer_size;
-  const auto index = i + j * lds;
-
-  if (result_indices_ptr[index] != ~index_msb_1_mask &&
-      !sample_filter(result_indices_ptr[index])) {
-    result_indices_ptr[index]   = utils::get_max_value<INDEX_T>();
-    result_distances_ptr[index] = utils::get_max_value<DISTANCE_T>();
-  }
-}
-
-template <class INDEX_T, class DISTANCE_T, class SAMPLE_FILTER_T>
-void apply_filter(INDEX_T* const result_indices_ptr,
-                  DISTANCE_T* const result_distances_ptr,
-                  const std::size_t lds,
-                  const std::uint32_t result_buffer_size,
-                  const std::uint32_t num_queries,
-                  SAMPLE_FILTER_T sample_filter,
-                  cudaStream_t cuda_stream)
-{
-  const std::uint32_t block_size = 256;
-  const std::uint32_t grid_size  = raft::ceildiv(num_queries * result_buffer_size, block_size);
-
-  apply_filter_kernel<<<grid_size, block_size, 0, cuda_stream>>>(result_indices_ptr,
-                                                                 result_distances_ptr,
-                                                                 lds,
-                                                                 result_buffer_size,
-                                                                 num_queries,
-                                                                 sample_filter);
-}
-
-template <class T>
-RAFT_KERNEL batched_memcpy_kernel(T* const dst,  // [batch_size, ld_dst]
-                                  const uint64_t ld_dst,
-                                  const T* const src,  // [batch_size, ld_src]
-                                  const uint64_t ld_src,
-                                  const uint64_t count,
-                                  const uint64_t batch_size)
-{
-  const auto tid = threadIdx.x + blockIdx.x * blockDim.x;
-  if (tid >= count * batch_size) { return; }
-  const auto i          = tid % count;
-  const auto j          = tid / count;
-  dst[i + (ld_dst * j)] = src[i + (ld_src * j)];
-}
-
-template <class T>
-void batched_memcpy(T* const dst,  // [batch_size, ld_dst]
-                    const uint64_t ld_dst,
-                    const T* const src,  // [batch_size, ld_src]
-                    const uint64_t ld_src,
-                    const uint64_t count,
-                    const uint64_t batch_size,
-                    cudaStream_t cuda_stream)
-{
-  assert(ld_dst >= count);
-  assert(ld_src >= count);
-  constexpr uint32_t block_size = 256;
-  const auto grid_size          = (batch_size * count + block_size - 1) / block_size;
-  batched_memcpy_kernel<T>
-    <<<grid_size, block_size, 0, cuda_stream>>>(dst, ld_dst, src, ld_src, count, batch_size);
 }
 
 // result_buffer (work buffer) for "multi-kernel"
@@ -1261,9 +906,10 @@ struct search : search_plan_impl<DataT, IndexT, DistanceT, SAMPLE_FILTER_T> {
          search_params params,
          const dataset_descriptor_host<DataT, IndexT, DistanceT>& dataset_desc,
          int64_t dim,
+         int64_t dataset_size,
          int64_t graph_degree,
          uint32_t topk)
-    : base_type(res, params, dataset_desc, dim, graph_degree, topk),
+    : base_type(res, params, dataset_desc, dim, dataset_size, graph_degree, topk),
       result_indices(0, raft::resource::get_cuda_stream(res)),
       result_distances(0, raft::resource::get_cuda_stream(res)),
       parent_node_list(0, raft::resource::get_cuda_stream(res)),
@@ -1416,8 +1062,11 @@ struct search : search_plan_impl<DataT, IndexT, DistanceT, SAMPLE_FILTER_T> {
                   SAMPLE_FILTER_T sample_filter,
                   host_device_mapper* host_hd_mapper,
                   graph_hd_mapper* host_graph_mapper,
-                  int* in_edges)
+                  int* in_edges,
+                  float* miss_rate,
+                  ffanns::neighbors::cagra::search_context<DATA_T, INDEX_T>* search_ctx = nullptr)
   {
+    RAFT_LOG_INFO("[search_multi_kernel] itopk_size: %u, max_iterations: %u, min_iterations: %u", itopk_size, max_iterations, min_iterations);
     #ifdef FFANNS_MISS_LOG
     static std::ofstream miss_log;
     static bool first_call = true;
@@ -1428,7 +1077,7 @@ struct search : search_plan_impl<DataT, IndexT, DistanceT, SAMPLE_FILTER_T> {
         first_call = false;
     }
     #endif
-    size_t hd_status[4] = {0, 0, 0, 0};
+    std::array<size_t, 4> hd_status = {0, 0, 0, 0};
     // cudaEvent_t start, stop, random_pickup_end;
     // cudaEvent_t find_topk_start, find_topk_end, pickup_parents_end, compute_dist_end, test_graph_end;
     // cudaEventCreate(&start);
@@ -1478,32 +1127,60 @@ struct search : search_plan_impl<DataT, IndexT, DistanceT, SAMPLE_FILTER_T> {
                                             hash_bitlen,
                                             sample_filter,
                                             hd_mapper,
-                                            hd_status,
-                                            d_result_indices.data(),
                                             stream);
     // cudaEventRecord(random_pickup_end, stream);
     // float total_find_topk_time = 0.0;
     // float total_pickup_time = 0.0;
     // float total_compute_dist_time = 0.0;
     unsigned iter = 0;
-    const unsigned int MAX_QUERIES = 10000;
-    assert(num_queries <= MAX_QUERIES);
+    // Disable per-call pinned allocation defaults (prefer external search_ctx when provided)
+    const unsigned int MAX_QUERIES = 0;   // legacy default disabled
+    const unsigned int MAX_TRANS_NUM = 0; // legacy default disabled
+    // assert(num_queries <= MAX_QUERIES);  // Skip assert when MAX_QUERIES=0
 
-    static auto cpu_distances = raft::make_pinned_vector<DistanceT>(res, MAX_QUERIES * search_width * graph_degree);
-    static auto host_indices = raft::make_pinned_vector<IndexT>(res, MAX_QUERIES * search_width * graph_degree);
-    static auto query_miss_counter = raft::make_pinned_vector<unsigned int>(res, MAX_QUERIES);
-    static auto host_graph_buffer = raft::make_pinned_vector<IndexT>(res, MAX_QUERIES * search_width * graph_degree);
+    // Always create per-call pinned buffers (baseline), but prefer external context if provided
+    const size_t host_elems = static_cast<size_t>(MAX_QUERIES) *
+                              static_cast<size_t>(search_width) *
+                              static_cast<size_t>(graph_degree);
+    auto cpu_distances = raft::make_pinned_vector<DistanceT>(res, host_elems);
+    auto host_indices = raft::make_pinned_vector<IndexT>(res, host_elems);
+    auto query_miss_counter = raft::make_pinned_vector<unsigned int>(res, static_cast<size_t>(MAX_QUERIES));
+    auto host_graph_buffer = raft::make_pinned_vector<IndexT>(res, host_elems);
+    auto host_vector_buffer = raft::make_pinned_matrix<DataT, int64_t, raft::row_major>(res, MAX_TRANS_NUM, dim);
+    auto is_internal_search = true;
+    std::optional<raft::pinned_scalar<unsigned int>> num_graph_miss_owner, num_miss1_owner, num_miss2_owner;
+
+    bool use_search_ctx = (search_ctx && search_ctx->has_buffers());
+    DistanceT*    cpu_distances_ptr      = use_search_ctx ? reinterpret_cast<DistanceT*>(search_ctx->cpu_distances)   : cpu_distances.data_handle();
+    IndexT*       host_indices_ptr       = use_search_ctx ? reinterpret_cast<IndexT*>(search_ctx->host_indices)       : host_indices.data_handle();
+    unsigned int* query_miss_counter_ptr = use_search_ctx ? search_ctx->query_miss_counter                             : query_miss_counter.data_handle();
+    IndexT*       host_graph_buffer_ptr  = use_search_ctx ? reinterpret_cast<IndexT*>(search_ctx->host_graph_buffer)   : host_graph_buffer.data_handle();
+    DataT*        host_vector_buffer_ptr = use_search_ctx ? reinterpret_cast<DataT*>(search_ctx->host_vector_buffer)   : host_vector_buffer.data_handle();
+    if (!use_search_ctx) {
+      num_graph_miss_owner.emplace(raft::make_pinned_scalar<unsigned int>(res, 0));
+      num_miss1_owner.emplace(raft::make_pinned_scalar<unsigned int>(res, 0));
+      num_miss2_owner.emplace(raft::make_pinned_scalar<unsigned int>(res, 0));
+    }
+    unsigned int* num_graph_miss_ptr = use_search_ctx ? search_ctx->num_graph_miss : num_graph_miss_owner->data_handle();
+    unsigned int* num_miss1_ptr = use_search_ctx ? search_ctx->num_miss1 : num_miss1_owner->data_handle();
+    unsigned int* num_miss2_ptr = use_search_ctx ? search_ctx->num_miss2 : num_miss2_owner->data_handle();
+
     ComputeDistanceContext<DataT, IndexT, DistanceT> compute_ctx(
       hd_mapper,
       graph_mapper,
-      hd_status,
+      hd_status.data(),
       in_edges,
-      cpu_distances.data_handle(),
-      host_indices.data_handle(),
-      query_miss_counter.data_handle(),
-      host_graph_buffer.data_handle(),
+      cpu_distances_ptr,
+      host_indices_ptr,
+      query_miss_counter_ptr,
+      host_graph_buffer_ptr,
+      host_vector_buffer_ptr,
+      num_graph_miss_ptr,
+      num_miss1_ptr,
+      num_miss2_ptr,
       0,
-      metric
+      metric,
+      is_internal_search
     );
     while (1) {
       // cudaEventRecord(find_topk_start, stream);
@@ -1599,6 +1276,8 @@ struct search : search_plan_impl<DataT, IndexT, DistanceT, SAMPLE_FILTER_T> {
 
       iter++;
     }  // while ( 1 )
+
+    RAFT_LOG_INFO("[search_multi_kernel] Total iterations: %d, MAX_ITERATIONS: %d", iter, max_iterations);
     // accumulator.print2();
     // RAFT_LOG_INFO("[search_multi_kernel] Average find_topk time: %f ms", total_find_topk_time);
     // RAFT_LOG_INFO("[search_multi_kernel] Average pickup time: %f ms", total_pickup_time);
@@ -1650,6 +1329,16 @@ struct search : search_plan_impl<DataT, IndexT, DistanceT, SAMPLE_FILTER_T> {
         num_queries, itopk_size, result_indices_ptr, result_buffer_allocation_size, stream);
     }
 
+    const uint32_t BLOCK = 256;
+    const auto grid_size = (num_queries + BLOCK - 1) / BLOCK;
+    naive_post_unique<<<grid_size, BLOCK, 0, stream>>>(
+            result_indices_ptr,
+            result_distances_ptr,
+            result_buffer_allocation_size,
+            result_buffer_size,
+            topk,
+            num_queries);
+
     // Copy results from working buffer to final buffer
     batched_memcpy(topk_indices_ptr,
                    topk,
@@ -1683,10 +1372,10 @@ struct search : search_plan_impl<DataT, IndexT, DistanceT, SAMPLE_FILTER_T> {
     // // RAFT_LOG_INFO("[compute_distance_to_child_nodes] Total time taken: %f ms", accumulator.total_time);
     // // RAFT_LOG_INFO("[search_multi_kernel] Random pickup time: %f ms", random_pickup_time);
     // RAFT_LOG_INFO("[search_multi_kernel] Total time taken: %f ms", total_time);
-    float miss_rate = hd_status[0] * 1.0 / hd_status[1];
-    float graph_miss_rate = hd_status[2] * 1.0 / hd_status[3];
-    RAFT_LOG_INFO("[search_multi_kernel] HD status, miss: %lu, total: %lu, miss_rate: %f", hd_status[0], hd_status[1], miss_rate);
-    RAFT_LOG_INFO("[search_multi_kernel] Graph HD status, miss: %lu, total: %lu, miss_rate: %f", hd_status[2], hd_status[3], graph_miss_rate);
+    // *miss_rate = hd_status[0] * 1.0 / hd_status[1];
+    // float graph_miss_rate = hd_status[2] * 1.0 / hd_status[3];
+    // RAFT_LOG_INFO("[search_multi_kernel] HD status, miss: %lu, total: %lu, miss_rate: %f", hd_status[0], hd_status[1], *miss_rate);
+    // RAFT_LOG_INFO("[search_multi_kernel] Graph HD status, miss: %lu, total: %lu, miss_rate: %f", hd_status[2], hd_status[3], graph_miss_rate);
 
     #ifdef FFANNS_MISS_LOG
     miss_rate = hd_status[0] * 1.0 / hd_status[1];
@@ -1710,54 +1399,3 @@ struct search : search_plan_impl<DataT, IndexT, DistanceT, SAMPLE_FILTER_T> {
 }  // namespace multi_kernel_search
 
 } // namespace ffanns::neighbors::cagra::detail
-
-/*
-std::vector<IndexT> host_result_indices(num_queries * ldd);
-  raft::copy(host_result_indices.data(), result_indices_ptr, num_queries * ldd, cuda_stream);
-  raft::copy(host_compute_distance_flags.data(), compute_distance_flags.data(), num_queries * ldd, cuda_stream);
-
-  const size_t vectors_per_query = search_width * graph_degree;
-  std::vector<IndexT> tmp_host_result_indices(num_queries * ldd);
-  rmm::device_uvector<IndexT> tmp_device_indices(num_queries * ldd, cuda_stream);
-
-  // 为每个query准备一个连续的缓冲区
-  std::vector<DataT> query_batch_buffer(vectors_per_query * dataset_desc.stride);
-  size_t count_idx = 0;
-
-  for (size_t query_id = 0; query_id < num_queries; query_id++) {
-      // 统计这个query需要传输的向量数量
-      size_t query_transfer_count = 0;
-      const size_t query_base_idx = query_id * ldd;
-      
-      // 第一遍：收集需要传输的向量
-      for (size_t tid = 0; tid < vectors_per_query; tid++) {
-          const size_t result_idx = query_base_idx + tid;
-          if (host_compute_distance_flags[result_idx]) {
-              const IndexT old_index = host_result_indices[result_idx];
-              // 复制到连续的缓冲区
-              std::memcpy(
-                  query_batch_buffer.data() + query_transfer_count * dataset_desc.stride,
-                  dataset_desc.ptr + old_index * dataset_desc.stride,
-                  dataset_desc.stride * sizeof(DataT)
-              );
-              tmp_host_result_indices[result_idx] = count_idx + query_transfer_count;
-              query_transfer_count++;
-          }
-      }
-      
-      // 批量传输这个query的所有向量
-      if (query_transfer_count > 0) {
-          raft::copy(
-              const_cast<DataT*>(dataset_desc.dd_ptr) + count_idx * dataset_desc.stride,
-              query_batch_buffer.data(),
-              query_transfer_count * dataset_desc.stride,
-              cuda_stream
-          );
-          count_idx += query_transfer_count;
-      }
-  }
-
-  // 最后传输索引映射
-  raft::copy(tmp_device_indices.data(), tmp_host_result_indices.data(), num_queries * ldd, cuda_stream);
-  */
- 

@@ -1,10 +1,9 @@
 #pragma once
 
 #include "compute_distance-ext.cuh"
-// #include "search_multi_cta.cuh"
+#include "search_multi_cta.cuh"
 #include "search_multi_kernel.cuh"
 #include "search_plan.cuh"
-// #include "search_single_cta.cuh"
 //TODO: Check if needed cagra.hpp
 #include "ffanns/neighbors/cagra.hpp"
 #include "ffanns/neighbors/common.hpp"
@@ -31,10 +30,11 @@ class factory {
     search_params const& params,
     const dataset_descriptor_host<DataT, IndexT, DistanceT>& dataset_desc,
     int64_t dim,
+    int64_t dataset_size,
     int64_t graph_degree,
     uint32_t topk)
   {
-    search_plan_impl_base plan(params, dim, graph_degree, topk);
+    search_plan_impl_base plan(params, dim, dataset_size, graph_degree, topk);
     return dispatch_kernel(res, plan, dataset_desc);
   }
 
@@ -44,14 +44,19 @@ class factory {
                   search_plan_impl_base& plan,
                   const dataset_descriptor_host<DataT, IndexT, DistanceT>& dataset_desc)
   {
-    // TODO: support other search modes
-    assert(plan.algo == search_algo::MULTI_KERNEL);
-    // return std::make_unique<
-    //     single_cta_search::search<DataT, IndexT, DistanceT, CagraSampleFilterT>>(
-    //     res, plan, dataset_desc, plan.dim, plan.graph_degree, plan.topk);
-    return std::make_unique<
-        multi_kernel_search::search<DataT, IndexT, DistanceT, CagraSampleFilterT>>(
-        res, plan, dataset_desc, plan.dim, plan.graph_degree, plan.topk);
+    switch (plan.algo) {
+        case search_algo::MULTI_CTA:
+            return std::make_unique<
+                multi_cta_search::search<DataT, IndexT, DistanceT, CagraSampleFilterT>>(
+                res, plan, dataset_desc, plan.dim, plan.dataset_size, plan.graph_degree, plan.topk);
+        case search_algo::MULTI_KERNEL:
+        case search_algo::AUTO:  // Currently defaults to MULTI_KERNEL
+            return std::make_unique<
+                multi_kernel_search::search<DataT, IndexT, DistanceT, CagraSampleFilterT>>(
+                res, plan, dataset_desc, plan.dim, plan.dataset_size, plan.graph_degree, plan.topk);
+        default:
+            RAFT_FAIL("Unsupported search algorithm");
+    }
   }
 };
 

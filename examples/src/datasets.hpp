@@ -158,14 +158,14 @@ namespace ffanns
     public:
         MSTuringANNS30M()
         {
-            n_samples_M_ = 12;
+            n_samples_M_ = 30;
             n_samples_ = n_samples_M_ * MILLION; // 10M samples
             n_dimensions_ = 100;   
             n_queries_ = 10000;    // 10K queries
 
-            ds_fn_ = "/data2/pyc/data/msturing30M/msturing30M.fbin";
-            qs_fn_ = "/data2/pyc/data/msturing30M/testQuery10K.fbin";
-            gt_fn_ = "/data2/pyc/data/msturing30M/msturing30M_gt.ivecs";
+            ds_fn_ = "/data0/pyc/msturing30M/msturing30M.fbin";
+            qs_fn_ = "/data0/pyc/msturing30M/testQuery10K.fbin";
+            gt_fn_ = "/data0/pyc/msturing30M/msturing30M_gt.ivecs";
         }
 
         DistanceType distance_type() const override
@@ -184,9 +184,9 @@ namespace ffanns
             n_dimensions_ = 128;   
             n_queries_ = 10000;    // 10K queries
 
-            ds_fn_ = "/data2/pyc/data/sift1M/sift_base.fbin";
-            qs_fn_ = "/data2/pyc/data/sift1M/sift_query.fbin";
-            gt_fn_ = "/data2/pyc/data/sift1M/sift_groundtruth.ivecs";
+            ds_fn_ = "/data0/pyc/sift1M/sift_base.fbin";
+            qs_fn_ = "/data0/pyc/sift1M/sift_query.fbin";
+            gt_fn_ = "/data0/pyc/sift1M/sift_groundtruth.ivecs";
         }
 
         DistanceType distance_type() const override
@@ -205,9 +205,9 @@ namespace ffanns
             n_dimensions_ = 128;   
             n_queries_ = 10000;    // 10K queries
 
-            ds_fn_ = "/data2/pyc/data/sift1B/base.1B.u8bin";
-            qs_fn_ = "/data2/pyc/data/sift1B/query.public.10K.u8bin";
-            gt_fn_ = "/data2/pyc/data/sift1B/sift_groundtruth.ivecs";
+            ds_fn_ = "/data0/pyc/sift1B/base.1B.u8bin";
+            qs_fn_ = "/data0/pyc/sift1B/query.public.10K.u8bin";
+            gt_fn_ = "/data0/pyc/sift1B/sift_groundtruth.ivecs";
         }
 
         DistanceType distance_type() const override
@@ -221,14 +221,14 @@ namespace ffanns
     public:
         WikipediaDataset()
         {
-            n_samples_M_ = 3;
+            n_samples_M_ = 6;
             n_samples_ = n_samples_M_ * MILLION; // 10M samples
             n_dimensions_ = 768;   
             n_queries_ = 5000;    // 10K queries
 
-            ds_fn_ = "/data2/pyc/data/wikipedia/wikipedia_base.bin";
-            qs_fn_ = "/data2/pyc/data/wikipedia/wikipedia_query.bin";
-            gt_fn_ = "/data2/pyc/data/msturing30M/msturing30M_gt.ivecs";
+            ds_fn_ = "/data/wikipedia/wikipedia_base.bin";
+            qs_fn_ = "/data/wikipedia/wikipedia_query.bin";
+            gt_fn_ = "/data/wikipedia/wikipedia_gt.ivecs";
         }
 
         DistanceType distance_type() const override
@@ -236,5 +236,53 @@ namespace ffanns
             return DistanceType::INNER_PRODUCT;
         }
     };
+
+    class MSMacroDataset : public Dataset<float>
+    {
+    public:
+        MSMacroDataset()
+        {
+            n_samples_M_ = 30;
+            n_samples_ = n_samples_M_ * MILLION; // 10M samples
+            n_dimensions_ = 768;   
+            n_queries_ = 9376 ;    
+
+            ds_fn_ = "/data0/pyc/msmacro/vectors.bin";
+            qs_fn_ = "/data0/pyc/msmacro/queries.bin";
+            gt_fn_ = "/data0/pyc/msturing30M/msturing30M_gt.ivecs";
+        }
+
+        DistanceType distance_type() const override
+        {
+            return DistanceType::INNER_PRODUCT;
+        }
+    };
+
+    // Factory function to create dataset by name
+    template<typename DataT>
+    std::unique_ptr<Dataset<DataT>> create_dataset(const std::string& name) {
+        if (name == "msturing-30M") {
+            if constexpr (std::is_same_v<DataT, float>) {
+                return std::make_unique<MSTuringANNS30M>();
+            }
+        } else if (name == "sift-1M") {
+            if constexpr (std::is_same_v<DataT, uint8_t>) {
+                return std::make_unique<Sift1M>();
+            }
+        } else if (name == "sift-1B") {
+            if constexpr (std::is_same_v<DataT, uint8_t>) {
+                return std::make_unique<Sift1B>();
+            }
+        } else if (name == "wikipedia") {
+            if constexpr (std::is_same_v<DataT, float>) {
+                return std::make_unique<WikipediaDataset>();
+            }
+        } else if (name == "msmacro") {
+            if constexpr (std::is_same_v<DataT, float>) {
+                return std::make_unique<MSMacroDataset>();
+            }
+        }
+        throw std::runtime_error("Unknown dataset: " + name);
+    }
 
 } // namespace ffanns

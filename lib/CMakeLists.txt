@@ -11,7 +11,7 @@ set(lang_list "CXX")
 # set(CMAKE_CUDA_COMPILER_LAUNCHER ccache)
 # set(CMAKE_CXX_COMPILER_LAUNCHER ccache)
 # only for Ampere architecture (RTX A6000, RTX 3090)
-set(CMAKE_CUDA_ARCHITECTURES "80")
+set(CMAKE_CUDA_ARCHITECTURES "90")
 
 include(rapids-cuda)
 rapids_cuda_init_architectures(FFANNS)
@@ -170,7 +170,6 @@ if(BUILD_SHARED_LIBS)
       src/neighbors/detail/cagra/compute_distance_standard_L2Expanded_uint8_uint32_dim128_t8.cu
       src/neighbors/detail/cagra/compute_distance_standard_L2Expanded_uint8_uint32_dim256_t16.cu
       src/neighbors/detail/cagra/compute_distance_standard_L2Expanded_uint8_uint32_dim512_t32.cu
-      # src/neighbors/detail/cagra/search_single_cta_float_uint32.cu
   )
 
   file(GLOB_RECURSE compute_distance_sources "src/neighbors/detail/cagra/compute_distance_*.cu")

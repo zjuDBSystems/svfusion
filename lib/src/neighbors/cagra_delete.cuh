@@ -16,10 +16,11 @@ namespace ffanns::neighbors::cagra {
                                                                               \
   void consolidate_delete(raft::resources const& handle,                      \
                 ffanns::neighbors::cagra::index<DTYPE, uint32_t>& index,      \
-                raft::host_matrix_view<DTYPE, int64_t> consolidate_dataset)     \
+                raft::host_matrix_view<DTYPE, int64_t> consolidate_dataset,   \
+                raft::host_matrix_view<uint32_t, int64_t> consolidate_graph)     \
    {                                                                          \
     ffanns::neighbors::cagra::detail::consolidate_delete<DTYPE, uint32_t>(    \
-      handle, index, consolidate_dataset);                                    \
+      handle, index, consolidate_dataset, consolidate_graph);                 \
    };                                                                         \
 
 }  // namespace ffanns::neighbors::cagra

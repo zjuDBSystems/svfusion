@@ -12,9 +12,10 @@ namespace ffanns::neighbors::cagra {
               std::optional<raft::device_matrix_view<T, int64_t, raft::layout_stride>> nddv,    \
               std::optional<raft::host_matrix_view<IdxT, int64_t, raft::layout_stride>> ngv,    \
               std::optional<raft::device_matrix_view<IdxT, int64_t>> ndgv,                      \
-              IdxT start_id, IdxT end_id)                                                       \
+              IdxT start_id, IdxT end_id,                                                       \
+              ffanns::neighbors::cagra::search_context<T, IdxT>* search_ctx)                    \
   {                                                                                             \
-    ffanns::neighbors::cagra::extend<T, IdxT>(handle, params, additional_dataset, idx, ndv, nddv, ngv, ndgv, start_id, end_id); \
+    ffanns::neighbors::cagra::extend<T, IdxT>(handle, params, additional_dataset, idx, ndv, nddv, ngv, ndgv, start_id, end_id, search_ctx); \
   }
   
 FFANNS_INST_CAGRA_EXTEND(float, uint32_t);

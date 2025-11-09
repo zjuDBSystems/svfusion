@@ -297,12 +297,14 @@ struct bitset_filter : public base_filter {
 
 struct bench_config {
     std::string dataset_name{"default_dataset_name"};
-    std::string base_log_dir{"/data2/pyc/workspace/ffanns/results"};
+    std::string base_log_dir{"/data/workspace/svfusion/results"};
     std::string mode{"device"};
     size_t chunk_size{16};
     
     bool enable_logging{true};
     std::string log_level{"INFO"};
+    
+    void set_workload_tag(std::string tag) { workload_tag_ = tag; }
     
     std::string get_miss_log_path() const {
         std::filesystem::path log_path = base_log_dir;
@@ -337,6 +339,26 @@ struct bench_config {
         return log_path.string();
     }
 
+    std::string get_result_path() const {
+        std::filesystem::path log_path = base_log_dir;
+        log_path /= dataset_name;
+        log_path /= "search_results";
+        log_path /= workload_tag_;
+        log_path /= ("search_" + std::to_string(chunk_size) + ".bin");
+        std::filesystem::create_directories(log_path.parent_path());
+        return log_path.string();
+    }
+
+    std::string get_time_log_path() const {
+      std::filesystem::path log_path = base_log_dir;
+      log_path /= dataset_name;
+      log_path /= "search_results";
+      log_path /= workload_tag_;
+      log_path /= ("time_log.csv");
+      std::filesystem::create_directories(log_path.parent_path());
+      return log_path.string();
+    }
+
     static bench_config& instance() {
         static bench_config config;
         return config;
@@ -344,6 +366,7 @@ struct bench_config {
 
 private:
     // private constructor to avoid direct instantiation
+    std::string workload_tag_;
     bench_config() = default;
 };
 

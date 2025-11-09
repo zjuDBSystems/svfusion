@@ -81,6 +81,45 @@ insert(unsigned team_size, IdxT* const table, const uint32_t bitlen, const IdxT 
   return ret;
 }
 
+// Search for a key in the hashmap
+// Returns 1 if found, 0 if not found
+template <class IdxT, unsigned SUPPORT_REMOVE = 0>
+RAFT_DEVICE_INLINE_FUNCTION uint32_t search(IdxT* const table,
+                                           const uint32_t bitlen, 
+                                           const IdxT key)
+{
+  const uint32_t size     = get_size(bitlen);
+  const uint32_t bit_mask = size - 1;
+  
+  // Use same hash strategy as insert for consistency
+#if 1
+  // Linear probing
+  IdxT index                = (key ^ (key >> bitlen)) & bit_mask;
+  constexpr uint32_t stride = 1;
+#else
+  // Double hashing
+  IdxT index            = key & bit_mask;
+  const uint32_t stride = (key >> bitlen) * 2 + 1;
+#endif
+  
+  constexpr IdxT hashval_empty = ~static_cast<IdxT>(0);
+  const IdxT removed_key       = key | utils::gen_index_msb_1_mask<IdxT>::value;
+  
+  for (unsigned i = 0; i < size; i++) {
+    const IdxT val = table[index];
+    if (val == key) {
+      return 1;  // Found
+    } else if (val == hashval_empty) {
+      return 0;  // Empty slot means key not present
+    } else if (SUPPORT_REMOVE) {
+      // Check if this key has been removed (for compatibility with CUVS)
+      if (val == removed_key) { return 0; }
+    }
+    index = (index + stride) & bit_mask;
+  }
+  return 0;  // Not found after full table scan
+}
+
 template <class IdxT>
 RAFT_DEVICE_INLINE_FUNCTION bool remove(IdxT* const table,
                                        const uint32_t bitlen,

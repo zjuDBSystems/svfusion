@@ -1,0 +1,85 @@
+syntax = "proto3";
+
+package ffanns.streaming;
+
+// 操作类型枚举
+enum OperationType {
+  UNKNOWN_OPERATION = 0;
+  SEARCH = 1;
+  INSERT = 2;
+  DELETE = 3;
+}
+
+// 数据类型枚举
+enum DataType {
+  UNKNOWN_TYPE = 0;
+  FLOAT32 = 1;
+  UINT8 = 2;
+}
+
+// 距离度量类型
+enum DistanceType {
+  UNKNOWN_DISTANCE = 0;
+  L2_EXPANDED = 1;
+  INNER_PRODUCT = 2;
+  EUCLIDEAN = 3;
+}
+
+// 基础向量查询消息
+message VectorQuery {
+  uint32 query_id = 1;                    // 唯一查询ID（递增序列）
+  OperationType operation = 2;            // 操作类型：SEARCH/INSERT/DELETE
+  
+  // 向量数据 - 根据数据类型选择其中一个
+  repeated float vector_float = 3;        // float32向量
+  bytes vector_uint8 = 4;                 // uint8向量（紧凑存储）
+  
+  DataType data_type = 5;                 // 数据类型标识
+  uint32 dimension = 6;                   // 向量维度
+  uint32 k = 7;                          // top-k结果数量（默认10）
+  
+  uint64 timestamp_us = 8;               // 微秒时间戳
+  DistanceType distance_type = 9;        // 距离度量类型
+  
+  // 插入/删除操作专用字段
+  uint64 vector_id = 10;                 // 向量ID（插入/删除时使用）
+}
+
+// 查询结果消息
+message VectorResult {
+  uint32 query_id = 1;                   // 对应的查询ID
+  OperationType operation = 2;           // 操作类型
+  
+  bool success = 3;                      // 是否成功
+  string error_message = 4;              // 错误信息（如果失败）
+  
+  // 搜索结果（仅SEARCH操作）
+  repeated uint32 indices = 5;           // 最近邻索引
+  repeated float distances = 6;          // 对应距离
+  
+  // 时间统计
+  uint64 start_time_us = 7;             // 开始处理时间（微秒）
+  uint64 end_time_us = 8;               // 结束处理时间（微秒）
+  double latency_ms = 9;                // 处理延迟（毫秒）
+}
+
+// 系统控制消息（预留接口，后续扩展）
+message ControlMessage {
+  enum ControlType {
+    UNKNOWN_CONTROL = 0;
+    SET_QPS = 1;                        // 设置QPS
+    STOP_BENCHMARK = 2;                 // 停止测试
+  }
+  
+  ControlType type = 1;
+  double qps_value = 2;                 // QPS值（当type=SET_QPS时使用）
+  uint64 timestamp_us = 3;
+}
+
+// 统计信息消息（预留接口，后续扩展）
+message StatsMessage {
+  uint64 timestamp_us = 1;
+  double current_qps = 2;               // 当前QPS
+  uint64 total_queries = 3;             // 总查询数
+  double avg_latency_ms = 4;            // 平均延迟
+}

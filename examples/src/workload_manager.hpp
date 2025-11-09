@@ -23,6 +23,8 @@ struct Operation {
     OperationType type;
     size_t start = 0;
     size_t end = 0;
+    double qps = 1000.0;  // QPS控制，默认1000
+    int k = 10;           // top-k结果数量（仅搜索操作使用）
 };
 
 template <typename DataT>

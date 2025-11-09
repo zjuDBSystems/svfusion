@@ -12,10 +12,11 @@ namespace ffanns::neighbors::cagra {
               raft::device_matrix_view<IdxT, int64_t, raft::row_major> neighbors,     \
               raft::device_matrix_view<float, int64_t, raft::row_major> distances,    \
               const ffanns::neighbors::filtering::base_filter& sample_filter,         \
-              bool external_flag)                                                     \
+              bool external_flag,                                                     \
+              ffanns::neighbors::cagra::search_context<T, IdxT>* search_ctx)          \
   {                                                                                   \
     ffanns::neighbors::cagra::search<T, IdxT>(                                        \
-      handle, params, index, queries, host_queries, neighbors, distances, sample_filter, external_flag);           \
+      handle, params, index, queries, host_queries, neighbors, distances, sample_filter, external_flag, search_ctx);           \
   }
 
 FFANNS_INST_CAGRA_SEARCH(float, uint32_t);

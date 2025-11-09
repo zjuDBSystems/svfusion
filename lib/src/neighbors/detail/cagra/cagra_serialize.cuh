@@ -102,10 +102,6 @@ void deserialize(raft::resources const& res, std::istream& is, index<T, IdxT>* i
   *index_ = index<T, IdxT>(res, metric);
   index_->update_graph(res, raft::make_const_mdspan(graph.view()));
 
-  auto in_edges = raft::make_host_vector<int, int64_t>(n_rows);
-  deserialize_mdspan(res, is, in_edges.view());
-  index_->own_in_edges(in_edges);
-
   auto hd_mapper_ptr = index_->hd_mapper_ptr();
   // hd_mapper_ptr->deserialize_from(res, is);
   bool has_dataset = raft::deserialize_scalar<bool>(res, is);
@@ -113,6 +109,9 @@ void deserialize(raft::resources const& res, std::istream& is, index<T, IdxT>* i
   // if (has_dataset) {
   //   index_->update_dataset(res, ffanns::neighbors::detail::deserialize_dataset<int64_t>(res, is));
   // }
+  // auto in_edges = raft::make_host_vector<int, int64_t>(n_rows);
+  // deserialize_mdspan(res, is, in_edges.view());
+  // index_->own_in_edges(in_edges);
 }
 
 template <typename T, typename IdxT>

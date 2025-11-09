@@ -15,6 +15,7 @@
 #include <raft/util/integer_utils.hpp>
 #include <rmm/cuda_stream_view.hpp>
 #include <raft/core/logger.hpp>
+#include <raft/core/pinned_mdarray.hpp>
 
 #include <optional>
 #include <variant>
@@ -47,14 +48,13 @@ namespace ffanns::neighbors::cagra
     bool attach_dataset_on_build = false;
   };
 
-  // TODO: Support other modes
   enum class search_algo
   {
-    /** For large batch sizes. */
-    SINGLE_CTA,
-    /** For small batch sizes. */
+    /** For small batch sizes with multi-path exploration. */
     MULTI_CTA,
+    /** For large batch sizes. */
     MULTI_KERNEL,
+    /** Automatic selection based on batch size. */
     AUTO
   };
    
@@ -80,9 +80,9 @@ namespace ffanns::neighbors::cagra
     // In the following we list additional search parameters for fine tuning.
     // Reasonable default values are automatically chosen.
 
-    // TODO: serach_algo
     /** Which search implementation to use. */
-    search_algo algo = search_algo::SINGLE_CTA;
+    // search_algo algo = search_algo::MULTI_KERNEL;
+    search_algo algo = search_algo::MULTI_CTA;
 
     /** Number of threads used to calculate a single distance. 4, 8, 16, or 32. */
     size_t team_size = 0;
@@ -107,11 +107,27 @@ namespace ffanns::neighbors::cagra
     /** Bit mask used for initial random seed node selection. */
     uint64_t rand_xor_mask = 0x128394;
 
-    /** Whether to use the persistent version of the kernel (only SINGLE_CTA is supported a.t.m.) */
-    bool persistent = false;
-    /** Persistent kernel: time in seconds before the kernel stops if no requests received. */
-    float persistent_lifetime = 2;
-    float persistent_device_usage = 1.0;
+  };
+
+  /**
+   * Lightweight search context: raw pointers provided by the application
+   * (typically pinned host buffers). No ownership or allocation here.
+   */
+  template <typename DataT, typename IndexT>
+  struct search_context {
+    // Raw pointers (may be nullptr if not provided)
+    float*        cpu_distances{};       // |Q| * (CTA) * search_width * graph_degree
+    IndexT*       host_indices{};        // |Q| * (CTA) * search_width * graph_degree
+    unsigned int* query_miss_counter{};  // |Q| * (CTA)
+    IndexT*       host_graph_buffer{};   // |Q| * (CTA) * search_width * graph_degree
+    DataT*        host_vector_buffer{};  // rows * stride
+    unsigned int *num_graph_miss;
+    unsigned int *num_miss1; 
+    unsigned int *num_miss2;
+
+    [[nodiscard]] bool has_buffers() const noexcept {
+      return (cpu_distances != nullptr) || (host_vector_buffer != nullptr);
+    }
   };
 
   struct extend_params
@@ -251,11 +267,15 @@ namespace ffanns::neighbors::cagra
     [[nodiscard]] inline auto host_in_edges() noexcept
         -> raft::host_vector_view<int, int64_t>
     {
-      return host_in_edges_.view();
+      return host_in_edges_view_;
     }
 
-    [[nodiscard]] auto d_in_edges() noexcept -> std::shared_ptr<rmm::device_uvector<int>> {
-      return d_in_edges_;
+    // [[nodiscard]] auto d_in_edges() noexcept -> std::shared_ptr<rmm::device_uvector<int>> {
+    //   return d_in_edges_;
+    // }
+
+    [[nodiscard]] auto d_in_edges() noexcept -> raft::device_vector_view<int, int64_t> {
+      return d_in_edges_view_;
     }
 
     // Don't allow copying the index for performance reasons (try avoiding copying data)
@@ -272,8 +292,8 @@ namespace ffanns::neighbors::cagra
         : ffanns::neighbors::index(),
           metric_(metric),
           graph_(raft::make_host_matrix<IdxT, int64_t>(0, 0)),
-          host_in_edges_(raft::make_host_vector<int, int64_t>(0)),
-          d_in_edges_(std::make_shared<rmm::device_uvector<int>>(0, raft::resource::get_cuda_stream(res))),
+          host_in_edges_view_(raft::make_host_vector_view<int, int64_t>(nullptr, 0)),
+          d_in_edges_view_(raft::make_device_vector_view<int, int64_t>(nullptr, 0)),
           dataset_(new ffanns::neighbors::empty_dataset<int64_t>(0)),
           d_dataset_(new ffanns::neighbors::empty_dataset<int64_t>(0)),
           hd_mapper_(std::make_shared<ffanns::neighbors::host_device_mapper>(res, 0, MAX_DEVICE_ROWS)),
@@ -293,7 +313,7 @@ namespace ffanns::neighbors::cagra
           ffanns::distance::DistanceType metric,
           raft::mdspan<const T, raft::matrix_extent<int64_t>, raft::row_major, data_accessor> dataset,
           raft::mdspan<const IdxT, raft::matrix_extent<int64_t>, raft::row_major, graph_accessor> knn_graph,
-          std::shared_ptr<rmm::device_uvector<int>> d_in_edges, 
+          raft::device_vector_view<int, int64_t> d_in_edges,
           std::shared_ptr<ffanns::neighbors::host_device_mapper> hd_mapper,
           std::shared_ptr<ffanns::neighbors::graph_hd_mapper> graph_hd_mapper,
           std::shared_ptr<ffanns::core::bitset<std::uint32_t, int64_t>> delete_bitset,
@@ -304,8 +324,8 @@ namespace ffanns::neighbors::cagra
         : ffanns::neighbors::index(),
           metric_(metric),
           graph_(raft::make_host_matrix<IdxT, int64_t>(0, 0)),
-          host_in_edges_(raft::make_host_vector<int, int64_t>(0)),
-          d_in_edges_(d_in_edges),
+          host_in_edges_view_(raft::make_host_vector_view<int, int64_t>(nullptr, 0)),
+          d_in_edges_view_(raft::make_device_vector_view<int, int64_t>(nullptr, 0)),
           dataset_(make_host_aligned_dataset(res, dataset, 16)),
           hd_mapper_(hd_mapper),
           graph_hd_mapper_(graph_hd_mapper),
@@ -319,6 +339,7 @@ namespace ffanns::neighbors::cagra
       RAFT_EXPECTS(dataset.extent(0) == knn_graph.extent(0),
                  "Dataset and knn_graph must have equal number of rows");
       update_graph(res, knn_graph);
+      update_in_edges(d_in_edges);
       raft::resource::sync_stream(res);
     }
 
@@ -370,21 +391,34 @@ namespace ffanns::neighbors::cagra
     d_graph_view_ = knn_graph;
   }
 
-  void own_in_edges(raft::host_vector<int, int64_t> in_edges) {
-    host_in_edges_ = raft::make_host_vector<int, int64_t>(in_edges.extent(0));
-    std::memcpy(host_in_edges_.data_handle(), 
-                in_edges.data_handle(), 
-                in_edges.size() * sizeof(int));
+  void update_in_edges(raft::host_vector_view<int, int64_t> in_edges) {
+    host_in_edges_view_ = in_edges;
   }
 
-  void own_in_edges(raft::resources const& res, raft::host_vector<int, int64_t> in_edges) {
-    host_in_edges_ = raft::make_host_vector<int, int64_t>(in_edges.extent(0));
-    d_in_edges_->resize(in_edges.extent(0), raft::resource::get_cuda_stream(res));
-    std::memcpy(host_in_edges_.data_handle(), 
-                in_edges.data_handle(), 
-                in_edges.size() * sizeof(int));
-    raft::copy(d_in_edges_->data(), host_in_edges_.data_handle(), in_edges.size(), raft::resource::get_cuda_stream(res));
+  void update_in_edges(raft::device_vector_view<int, int64_t> in_edges) {
+    d_in_edges_view_ = in_edges;
   }
+
+  void update_in_edges(raft::host_vector_view<int, int64_t> host_in_edges, raft::device_vector_view<int, int64_t> d_in_edges) {
+    host_in_edges_view_ = host_in_edges;
+    d_in_edges_view_ = d_in_edges;
+  }
+
+  // void own_in_edges(raft::host_vector<int, int64_t> in_edges) {
+  //   host_in_edges_ = raft::make_host_vector<int, int64_t>(in_edges.extent(0));
+  //   std::memcpy(host_in_edges_.data_handle(), 
+  //               in_edges.data_handle(), 
+  //               in_edges.size() * sizeof(int));
+  // }
+
+  // void own_in_edges(raft::resources const& res, raft::host_vector<int, int64_t> in_edges) {
+  //   host_in_edges_ = raft::make_host_vector<int, int64_t>(in_edges.extent(0));
+  //   d_in_edges_->resize(in_edges.extent(0), raft::resource::get_cuda_stream(res));
+  //   std::memcpy(host_in_edges_.data_handle(), 
+  //               in_edges.data_handle(), 
+  //               in_edges.size() * sizeof(int));
+  //   raft::copy(d_in_edges_->data(), host_in_edges_.data_handle(), in_edges.size(), raft::resource::get_cuda_stream(res));
+  // }
 
   void update_delete_bitset(std::shared_ptr<ffanns::core::bitset<std::uint32_t, int64_t>> delete_bitset) {
     delete_bitset_ = delete_bitset;
@@ -463,8 +497,8 @@ namespace ffanns::neighbors::cagra
     raft::host_matrix<IdxT, int64_t, raft::row_major> graph_;
     raft::host_matrix_view<const IdxT, int64_t, raft::row_major> graph_view_;
     raft::device_matrix_view<IdxT, int64_t, raft::row_major> d_graph_view_;
-    raft::host_vector<int, int64_t> host_in_edges_;  
-    std::shared_ptr<rmm::device_uvector<int>> d_in_edges_; 
+    raft::host_vector_view<int, int64_t> host_in_edges_view_;
+    raft::device_vector_view<int, int64_t> d_in_edges_view_;
     std::shared_ptr<neighbors::host_device_mapper> hd_mapper_;
     std::shared_ptr<neighbors::graph_hd_mapper> graph_hd_mapper_;
     std::unique_ptr<neighbors::dataset<int64_t>> dataset_;
@@ -489,6 +523,8 @@ auto build(raft::resources const& res,
            raft::device_matrix<uint32_t, int64_t>& device_graph_ref,
            std::shared_ptr<ffanns::core::bitset<std::uint32_t, int64_t>> delete_bitset,
            std::shared_ptr<rmm::device_uvector<uint32_t>> tag_to_id,
+           raft::host_vector_view<int, int64_t> host_in_edges_view,
+           raft::device_vector_view<int, int64_t> d_in_edges_view,
            uint32_t start_id, uint32_t end_id)
   -> ffanns::neighbors::cagra::index<float, uint32_t>;
 
@@ -501,8 +537,10 @@ auto build(raft::resources const& res,
           raft::device_matrix<uint32_t, int64_t>& device_graph_ref,
           std::shared_ptr<ffanns::core::bitset<std::uint32_t, int64_t>> delete_bitset,
           std::shared_ptr<rmm::device_uvector<uint32_t>> tag_to_id,
+          raft::host_vector_view<int, int64_t> host_in_edges_view,
+          raft::device_vector_view<int, int64_t> d_in_edges_view,
           uint32_t start_id, uint32_t end_id)
--> ffanns::neighbors::cagra::index<uint8_t, uint32_t>;
+  -> ffanns::neighbors::cagra::index<uint8_t, uint32_t>;
 
 void extend(
   raft::resources const& handle,
@@ -517,7 +555,8 @@ void extend(
     new_graph_buffer_view                                                           = std::nullopt,
   std::optional<raft::device_matrix_view<uint32_t, int64_t>> 
     new_d_graph_buffer_view                                                         = std::nullopt,
-  uint32_t start_id = 0, uint32_t end_id = 0);
+  uint32_t start_id = 0, uint32_t end_id = 0,
+  ffanns::neighbors::cagra::search_context<float, uint32_t>* search_ctx = nullptr);
 
 void extend(
   raft::resources const& handle,
@@ -532,7 +571,8 @@ void extend(
     new_graph_buffer_view                                                             = std::nullopt,
   std::optional<raft::device_matrix_view<uint32_t, int64_t>> 
     new_d_graph_buffer_view                                                           = std::nullopt,
-  uint32_t start_id = 0, uint32_t end_id = 0);
+  uint32_t start_id = 0, uint32_t end_id = 0,
+  ffanns::neighbors::cagra::search_context<uint8_t, uint32_t>* search_ctx = nullptr);
 
 void search(raft::resources const& res,
             ffanns::neighbors::cagra::search_params const& params,
@@ -543,7 +583,8 @@ void search(raft::resources const& res,
             raft::device_matrix_view<float, int64_t, raft::row_major> distances,
             const ffanns::neighbors::filtering::base_filter& sample_filter =
               ffanns::neighbors::filtering::none_sample_filter{},
-              bool external_flag = false);
+              bool external_flag = false,
+              ffanns::neighbors::cagra::search_context<float, uint32_t>* search_ctx = nullptr);
 
 void search(raft::resources const& res,
             ffanns::neighbors::cagra::search_params const& params,
@@ -554,7 +595,8 @@ void search(raft::resources const& res,
             raft::device_matrix_view<float, int64_t, raft::row_major> distances,
             const ffanns::neighbors::filtering::base_filter& sample_filter =
               ffanns::neighbors::filtering::none_sample_filter{},
-              bool external_flag = false);
+              bool external_flag = false,
+              ffanns::neighbors::cagra::search_context<uint8_t, uint32_t>* search_ctx = nullptr);
 
 void serialize(raft::resources const& handle,
                const std::string& filename,
@@ -587,10 +629,12 @@ void lazy_delete(raft::resources const& handle,
 
 void consolidate_delete(raft::resources const& handle,
                         ffanns::neighbors::cagra::index<float, uint32_t>& index,
-                        raft::host_matrix_view<float, int64_t> consolidate_dataset);
+                        raft::host_matrix_view<float, int64_t> consolidate_dataset,
+                        raft::host_matrix_view<uint32_t, int64_t> consolidate_graph);
 
 void consolidate_delete(raft::resources const& handle,
                         ffanns::neighbors::cagra::index<uint8_t, uint32_t>& index,
-                        raft::host_matrix_view<uint8_t, int64_t> consolidate_dataset);
+                        raft::host_matrix_view<uint8_t, int64_t> consolidate_dataset,
+                        raft::host_matrix_view<uint32_t, int64_t> consolidate_graph);
 
 } // ffanns::neighbors::cagra

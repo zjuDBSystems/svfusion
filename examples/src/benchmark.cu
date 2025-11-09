@@ -18,8 +18,8 @@ std::string getArgValue(int argc, char** argv, const std::string& option, const 
 }
 
 int main(int argc, char** argv) {
-    std::string config_file = "/data2/pyc/workspace/streaming_anns/runbooks/test.yaml";
-    int gpu_id = 7;
+    std::string config_file = "/data/workspace/streaming_anns/runbooks/streaming_test.yaml";
+    int gpu_id = 0;
     std::string data_type = "float";   
 
     if (argc > 1) {
@@ -59,13 +59,16 @@ int main(int argc, char** argv) {
 
     // 设置内存池资源
     rmm::mr::pool_memory_resource<rmm::mr::device_memory_resource> pool_mr(
-        rmm::mr::get_current_device_resource(), 38 * 1024 * 1024 * 1024ull, 39 * 1024 * 1024 * 1024ull);
+        rmm::mr::get_current_device_resource(), 50 * 1024 * 1024 * 1024ull, 55 * 1024 * 1024 * 1024ull);
     rmm::mr::tracking_resource_adaptor<rmm::mr::pool_memory_resource<rmm::mr::device_memory_resource>> 
         tracking_mr(&pool_mr, false);
     rmm::mr::set_current_device_resource(&tracking_mr);
     
     size_t n_streams = 4;
     raft::resource::set_cuda_stream_pool(dev_resources, std::make_shared<rmm::cuda_stream_pool>(n_streams));
+    std::filesystem::path yaml_path(config_file);
+    std::string workload_tag = yaml_path.filename().string();
+    ffanns::neighbors::bench_config::instance().set_workload_tag(workload_tag);
 
     try {
         if (data_type == "float" || data_type == "float32") {

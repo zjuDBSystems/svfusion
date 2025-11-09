@@ -4,6 +4,7 @@
 #include <raft/core/device_mdarray.hpp>
 #include <raft/core/logger.hpp>
 #include <chrono>
+#include <rmm/device_uvector.hpp>
 
 namespace ffanns {
 namespace test {
@@ -62,6 +63,14 @@ void WorkloadManager<DataT>::parse_config() {
             throw std::runtime_error("未知操作类型: " + op_type);
         }
         
+        // 解析QPS和k值（可选字段）
+        if (op_config["qps"]) {
+            op.qps = op_config["qps"].as<double>();
+        }
+        if (op_config["k"]) {
+            op.k = op_config["k"].as<int>();
+        }
+        
         operations_.push_back(op);
     }
     
@@ -94,6 +103,12 @@ std::unique_ptr<ffanns::Dataset<DataT>> prepare_dataset(const std::string& datas
             return std::make_unique<ffanns::WikipediaDataset>();
         } else {
             throw std::runtime_error("wikipedia35M 仅支持 float 数据类型");
+        }
+    } else if (dataset_name == "msmacro") {
+        if constexpr (std::is_same_v<DataT, float>) {
+            return std::make_unique<ffanns::MSMacroDataset>();
+        } else {
+            throw std::runtime_error("msmacro 仅支持 float 数据类型");
         }
     } 
     throw std::runtime_error("未知数据集: " + dataset_name);
@@ -150,7 +165,7 @@ std::vector<uint32_t> perform_search(
     using namespace ffanns::neighbors;
     cagra::search_params search_params;
     search_params.itopk_size = 256;
-    search_params.max_iterations = 200;
+    search_params.max_iterations = 225;
     search_params.metric = index.metric();
     int topk = 10;
     auto neighbor_indices = raft::make_device_matrix<uint32_t, int64_t>(
@@ -188,7 +203,7 @@ void WorkloadManager<DataT>::run_workload(
 {
     using namespace ffanns::neighbors;
     ffanns::neighbors::cagra::index<float,uint32_t>::set_max_device_rows(1000000);
-    ffanns::neighbors::cagra::index<float,uint32_t>::set_max_graph_device_rows(2000000);
+    ffanns::neighbors::cagra::index<float,uint32_t>::set_max_graph_device_rows(1000000);
     
     // 加载查询向量
     auto d_query_vectors = load_query_vectors<DataT>(dev_resources, ext_dataset.query_filename());
@@ -256,20 +271,38 @@ void WorkloadManager<DataT>::run_workload(
     //     device_graph_space.data_handle(), d_graph_offset, index_params.graph_degree);
     
     auto start = std::chrono::high_resolution_clock::now();
+    // Prepare external in_edges owners and views
+    auto in_edges_host = raft::make_host_vector<int, int64_t>(max_rows);
+    auto in_edges_device = raft::make_device_vector<int, int64_t>(dev_resources, max_rows);
+    auto host_in_edges_view = raft::make_host_vector_view<int, int64_t>(in_edges_host.data_handle(), n_samples);
+    auto dev_in_edges_view = raft::make_device_vector_view<int, int64_t>(in_edges_device.data_handle(), n_samples);
     auto index = cagra::build(
         dev_resources, index_params, dataset_view, graph_view, device_data_owner, 
-        device_graph_space, delete_bitset_ptr, tag_to_id, 0, n_samples);
+        device_graph_space, delete_bitset_ptr, tag_to_id, host_in_edges_view, dev_in_edges_view, 0, n_samples);
     index.update_host_delete_bitset(host_delete_bitset_ptr);
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    double duration = std::chrono::duration<double>(end - start).count();
     auto device_space_view = device_data_owner.view();
-    RAFT_LOG_INFO("Total time: %.2f seconds", duration.count() / 1000.0);
+    RAFT_LOG_INFO("Total time: %.2f seconds", duration);
     RAFT_LOG_INFO("- Graph memory: %.2f MB", 
         (index.graph().size() * sizeof(uint32_t)) / (1024.0 * 1024.0));
     RAFT_LOG_INFO("- Dataset memory: %.2f MB",  (index.dataset().size() * sizeof(DataT)) / (1024.0 * 1024.0));
     RAFT_LOG_INFO("- Dataset size: %ld x %ld", index.dataset().extent(0), index.dataset().extent(1));
-
+    
+    log_step_time_csv(config, 0, first_op.type, duration, true, index.hd_mapper_ptr()->miss_rate);
+    auto history_delete_count = 0;
     auto& async_consolidate_state = ffanns::neighbors::cagra::detail::get_async_consolidate_state<DataT, uint32_t>();
+
+  
+    // for (size_t j = 0; j < 50; j++) {
+    //     auto result = perform_search(dev_resources, index, 
+    //                     raft::make_const_mdspan(d_query_vectors.view()),
+    //                     raft::make_const_mdspan(h_query_vectors.view()),
+    //                     delete_filter);
+    // }
+    auto mapper =  index.hd_mapper_ptr();
+    mapper->decay_recent_access(0, dev_resources);
+    
     // 执行操作
     for (size_t i = 1; i < operations_.size(); i++) {
         if (async_consolidate_state.has_task_result()) {
@@ -284,6 +317,7 @@ void WorkloadManager<DataT>::run_workload(
         const auto& op = operations_[i];
         RAFT_LOG_INFO("[run_workload] Execute Operation %zu: %d", i + 1, static_cast<int>(op.type));
         auto start_op = std::chrono::high_resolution_clock::now();
+        auto end_op = std::chrono::high_resolution_clock::now();
 
         switch (op.type) {
             case OperationType::INSERT: {
@@ -333,23 +367,44 @@ void WorkloadManager<DataT>::run_workload(
                 }
                 updated_device_graph = raft::make_device_matrix_view<uint32_t, int64_t>(
                     device_graph_space.data_handle(), d_graph_offset, index_params.graph_degree);
-            
+                
+                start_op = std::chrono::high_resolution_clock::now();
                 ffanns::neighbors::cagra::extend(dev_resources, extend_params, additional_dataset, index,
                     updated_dataset, updated_device_dataset, updated_graph, updated_device_graph, op.start, op.end);
+                end_op = std::chrono::high_resolution_clock::now();
                 
                 // use free_slots, restore offset length
                 if (index.size() < offset) {
+                    RAFT_LOG_INFO("[workload_manager] using free slots");
                     offset -= n_samples;
                 }
+                
                 break;
             }
             
             case OperationType::SEARCH: {
+                start_op = std::chrono::high_resolution_clock::now();
                 if (offset > 0) {  // 只有当我们有数据时才进行搜索
+                    // Original: Full query batch
                     auto result = perform_search(dev_resources, index, 
                         raft::make_const_mdspan(d_query_vectors.view()),
                         raft::make_const_mdspan(h_query_vectors.view()),
                         delete_filter);
+                    
+                    // TEST: Only use first query for Multi-CTA testing
+                    // auto d_first_query = raft::make_device_matrix_view<const DataT, int64_t, raft::row_major>(
+                    //     d_query_vectors.data_handle(), 1, d_query_vectors.extent(1));
+                    // auto h_first_query = raft::make_host_matrix_view<const DataT, int64_t, raft::row_major>(
+                    //     h_query_vectors.data_handle(), 1, h_query_vectors.extent(1));
+                    
+                    // printf("[TEST] Running Multi-CTA search with single query (dim=%ld)\n", d_query_vectors.extent(1));
+                    
+                    // auto result = perform_search(dev_resources, index, 
+                    //     d_first_query,
+                    //     h_first_query,
+                    //     delete_filter);
+                    
+                    end_op = std::chrono::high_resolution_clock::now();
                     step_neighbors_.push_back(result);
 
                     save_step_neighbors_to_binary(step_neighbors_, i+1, config);
@@ -358,12 +413,10 @@ void WorkloadManager<DataT>::run_workload(
             }
             
             case OperationType::DELETE: {
+                start_op = std::chrono::high_resolution_clock::now();
                 if (offset > 0) {  // 只有当我们有数据时才进行删除
-                    // auto start = std::chrono::high_resolution_clock::now();
                     ffanns::neighbors::cagra::lazy_delete(dev_resources, index, op.start, op.end);
-                    // auto end = std::chrono::high_resolution_clock::now();
-                    // auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-                    // RAFT_LOG_INFO("删除时间: %.2f 秒", duration.count() / 1000.0);
+                    end_op = std::chrono::high_resolution_clock::now();
                     
                     auto count_scalar = raft::make_device_scalar<int64_t>(dev_resources, 0);
                     delete_bitset_ptr->count(dev_resources, count_scalar.view());
@@ -372,29 +425,54 @@ void WorkloadManager<DataT>::run_workload(
                               raft::resource::get_cuda_stream(dev_resources));
                     raft::resource::sync_stream(dev_resources);
                     RAFT_LOG_INFO("[run_workload] Delete Count = %ld", delete_bitset_ptr->size() - host_count);
+                    history_delete_count += (op.end - op.start);
 
-                    // TODO: set a consolidate threshold
-                    // bool should_consolidate = (delete_bitset_ptr->size() - host_count) > threshold;
-                    // if ((i+1) % 30 == 0 && (i > 2)) {
+                    RAFT_LOG_INFO("[run_workload] Activate Count = %ld", offset - (delete_bitset_ptr->size() - host_count));
+                    int64_t activate_count = offset - (delete_bitset_ptr->size() - host_count);
+                    float threshold = 0.2;
+                    // if (i < 100) {threshold = 0.2;}    // try to dynamic adjust threshold
+                    // if ((history_delete_count * 1.0f / activate_count) >= threshold) {
+                    //     RAFT_LOG_INFO("[run_workload] Consolidated Delete Count = %ld", history_delete_count);
+                    // // if (history_delete_count >= 0.1 * 30000000) {
                     //     auto consolidate_host_dataset = raft::make_host_matrix_view<DataT, int64_t>(host_space_view.data_handle(), offset, n_dim);
-                    //     ffanns::neighbors::cagra::consolidate_delete(dev_resources, index, consolidate_host_dataset);
+                    //     auto consolidate_graph = raft::make_host_matrix_view<uint32_t, int64_t>(
+                    //         graph_space.data_handle(), offset, index_params.graph_degree);
+                    //     ffanns::neighbors::cagra::consolidate_delete(dev_resources, index, consolidate_host_dataset, consolidate_graph);
+                    //     end_op = std::chrono::high_resolution_clock::now();
+                    //     history_delete_count = 0;
                     //     // async_consolidate_state.submit_task(dev_resources, index, consolidate_host_dataset);
                     //     // auto edge_log = index.get_edge_log_ptr();
                     //     // edge_log->set_consolidating(true);
+                    //     auto mapper =  index.hd_mapper_ptr();
+                    //     mapper->decay_recent_access(0, dev_resources);
                     // }
                 }
                 break;
             }
         }
 
-        auto end_op = std::chrono::high_resolution_clock::now();
+        // if (i == 1) {
+        //     for (size_t j = 0; j < 50; j++) {
+        //         auto result = perform_search(dev_resources, index, 
+        //                         raft::make_const_mdspan(d_query_vectors.view()),
+        //                         raft::make_const_mdspan(h_query_vectors.view()),
+        //                         delete_filter);
+        //     }
+        //     auto mapper =  index.hd_mapper_ptr();
+        //     mapper->decay_recent_access(0, dev_resources);
+        // }
+
+        // auto end_op = std::chrono::high_resolution_clock::now();
         auto duration_op = std::chrono::duration_cast<std::chrono::milliseconds>(end_op - start_op);
-        RAFT_LOG_INFO("Operation %zu (%d) Time: %.2f seconds", i + 1, static_cast<int>(op.type), duration_op.count() / 1000.0);
+        double duration = std::chrono::duration<double>(end_op - start_op).count();
+        RAFT_LOG_INFO("Operation %zu (%d) Time: %.2f seconds", i + 1, static_cast<int>(op.type), duration);
+        log_step_time_csv(config, i, op.type, duration, false, index.hd_mapper_ptr()->miss_rate);
+        index.hd_mapper_ptr()->miss_rate = 0.0f;
         auto mapper =  index.hd_mapper_ptr();
-        // auto d_in_edges = index.d_in_edges();
-        // std::string count_file_name = bench_config::instance().get_count_log_path(i);
-        // mapper->snapshot_access_counts(count_file_name, nullptr, d_in_edges->data(), raft::resource::get_cuda_stream(dev_resources));
-        mapper->decay_recent_access(0, dev_resources);
+        auto d_in_edges = index.d_in_edges();
+        std::string count_file_name = bench_config::instance().get_count_log_path(i);
+        // mapper->snapshot_access_counts(count_file_name, nullptr, d_in_edges.data_handle(), raft::resource::get_cuda_stream(dev_resources));
+        // mapper->decay_recent_access(0, dev_resources);
     }
     
     // 保存搜索结果

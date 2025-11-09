@@ -1,5 +1,6 @@
 #pragma once
 
+#include "workload_manager.hpp"
 #include <ffanns/neighbors/common.hpp>
 #include <raft/core/device_mdarray.hpp>
 #include <raft/core/device_resources.hpp>
@@ -336,6 +337,35 @@ void save_step_neighbors_to_binary(
         RAFT_LOG_ERROR("Error saving to binary: %s", e.what());
         throw;
     }
+}
+
+void log_step_time_csv(const ffanns::neighbors::bench_config& config,
+                              int                       step,
+                              const ffanns::test::OperationType    op,
+                              double                    seconds,
+                              bool                first_write = false,
+                              float                  miss_rate = 0.0f)
+{
+    std::filesystem::path csv_path = config.get_time_log_path();
+    std::ios_base::openmode mode =
+        first_write ? std::ios::out               // 覆盖
+                    : std::ios::app;              // 追加
+
+    std::ofstream out(csv_path, mode);
+    if (!out) {
+        RAFT_LOG_ERROR("Cannot open time-log file: %s", csv_path.c_str());
+        return;
+    }
+
+    if (first_write)                              // 只在第一次写表头
+        out << "step,operation,time,miss_rate\n";
+
+    static const char* op_name[] = { "insert", "search", "delete" };
+
+    out << step << ','
+        << op_name[static_cast<int>(op)] << ','
+        << std::fixed << std::setprecision(12) << seconds << ','
+        << std::fixed << std::setprecision(12) << miss_rate <<'\n';
 }
 
 void print_device_properties(const cudaDeviceProp& prop) {

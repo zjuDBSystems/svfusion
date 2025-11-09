@@ -32,10 +32,12 @@ index<T, IdxT> build(
   raft::device_matrix<IdxT, int64_t>& device_graph_ref,  
   std::shared_ptr<ffanns::core::bitset<std::uint32_t, int64_t>> delete_bitset,
   std::shared_ptr<rmm::device_uvector<IdxT>> tag_to_id,
+  raft::host_vector_view<int, int64_t> host_in_edges_view,
+  raft::device_vector_view<int, int64_t> d_in_edges_view,
   IdxT start_id, IdxT end_id)
 {
   return ffanns::neighbors::cagra::detail::build<T, IdxT, Accessor>(res, params, dataset, index_graph,
-    device_dataset_ref, device_graph_ref, delete_bitset, tag_to_id, start_id, end_id);
+    device_dataset_ref, device_graph_ref, delete_bitset, tag_to_id, host_in_edges_view, d_in_edges_view, start_id, end_id);
 }
 
 template <typename T, typename IdxT, typename CagraSampleFilterT>
@@ -47,7 +49,8 @@ void search_with_filtering(raft::resources const& res,
                            raft::device_matrix_view<IdxT, int64_t, raft::row_major> neighbors,
                            raft::device_matrix_view<float, int64_t, raft::row_major> distances,
                            CagraSampleFilterT sample_filter = CagraSampleFilterT(),
-                           bool external_flag = false)
+                           bool external_flag = false,
+                           search_context<T, IdxT>* search_ctx = nullptr)
 {
   RAFT_EXPECTS(
     queries.extent(0) == neighbors.extent(0) && queries.extent(0) == distances.extent(0) && queries.extent(0) == host_queries.extent(0),
@@ -71,7 +74,7 @@ void search_with_filtering(raft::resources const& res,
     distances.data_handle(), distances.extent(0), distances.extent(1));
 
   return cagra::detail::search_main<T, internal_IdxT, CagraSampleFilterT, IdxT>(
-    res, params, idx, queries_internal, host_queries_internal, neighbors_internal, distances_internal, sample_filter, external_flag);
+    res, params, idx, queries_internal, host_queries_internal, neighbors_internal, distances_internal, sample_filter, external_flag, search_ctx);
 }
 
 template <typename T, typename IdxT>
@@ -83,14 +86,15 @@ void search(raft::resources const& res,
             raft::device_matrix_view<IdxT, int64_t, raft::row_major> neighbors,
             raft::device_matrix_view<float, int64_t, raft::row_major> distances,
             const ffanns::neighbors::filtering::base_filter& sample_filter_ref,
-            bool external_flag = false)
+            bool external_flag = false,
+            search_context<T, IdxT>* search_ctx = nullptr)
 {
   try {
     using none_filter_type  = ffanns::neighbors::filtering::none_sample_filter;
     auto& sample_filter     = dynamic_cast<const none_filter_type&>(sample_filter_ref);
     auto sample_filter_copy = sample_filter;
     return search_with_filtering<T, IdxT, none_filter_type>(
-      res, params, idx, queries, host_queries, neighbors, distances, sample_filter_copy, external_flag);
+      res, params, idx, queries, host_queries, neighbors, distances, sample_filter_copy, external_flag, search_ctx);
     return;
   } catch (const std::bad_cast&) {
     // RAFT_FAIL("Now only suupport none-filter");
@@ -102,7 +106,7 @@ void search(raft::resources const& res,
         sample_filter_ref);
     auto sample_filter_copy = sample_filter;
     return search_with_filtering<T, IdxT, decltype(sample_filter_copy)>(
-      res, params, idx, queries, host_queries, neighbors, distances, sample_filter_copy, external_flag);
+      res, params, idx, queries, host_queries, neighbors, distances, sample_filter_copy, external_flag, search_ctx);
   } catch (const std::bad_cast&) {
     RAFT_FAIL("Unsupported sample filter type");
   }
@@ -119,9 +123,10 @@ void extend(
   std::optional<raft::device_matrix_view<T, int64_t, raft::layout_stride>> nddv,
   std::optional<raft::host_matrix_view<IdxT, int64_t, raft::layout_stride>> ngv,
   std::optional<raft::device_matrix_view<IdxT, int64_t>> ndgv,
-  IdxT start_id, IdxT end_id)
+  IdxT start_id, IdxT end_id,
+  search_context<T, IdxT>* search_ctx)
 {
-  cagra::extend_core<T, IdxT>(handle, params, additional_dataset, index, ndv, nddv, ngv, ndgv, start_id, end_id);
+  cagra::extend_core<T, IdxT>(handle, params, additional_dataset, index, ndv, nddv, ngv, ndgv, start_id, end_id, search_ctx);
 }
 
 }
